@@ -61,7 +61,7 @@ pub fn next_consolidated_number(bod_dir: &std::path::Path, sanitized_branch: &st
     max_num + 1
 }
 
-/// List all review .md files in .bod/, excluding consolidated reports and bugfix log.
+/// List all review .md files in the state directory, excluding consolidated reports and bugfix log.
 pub fn list_review_files(bod_dir: &std::path::Path) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
 

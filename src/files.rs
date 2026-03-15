@@ -1,22 +1,19 @@
+use crate::paths;
 use std::fs;
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-
-pub fn ensure_bod_dir(repo_root: &Path) -> Result<PathBuf, String> {
-    let bod_dir = repo_root.join(".bod");
-    if !bod_dir.exists() {
-        fs::create_dir_all(&bod_dir)
-            .map_err(|e| format!("Failed to create .bod directory: {}", e))?;
-    }
-    Ok(bod_dir)
-}
 
 const BUGFIX_LOG: &str = "bugfix.log.md";
 
-/// Remove all .md files from the .bod directory, except the bugfix log.
-pub fn clean_bod_dir(bod_dir: &Path) -> Result<u32, String> {
+pub fn ensure_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    let state_dir = paths::ensure_repo_state_dir(repo_root)?;
+    migrate_legacy_state_dir(repo_root, &state_dir)?;
+    Ok(state_dir)
+}
+
+/// Remove all generated review .md files from the state directory, except the bugfix log.
+pub fn clean_state_dir(state_dir: &Path) -> Result<u32, String> {
     let mut count = 0;
-    if let Ok(entries) = fs::read_dir(bod_dir) {
+    if let Ok(entries) = fs::read_dir(state_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -30,64 +27,86 @@ pub fn clean_bod_dir(bod_dir: &Path) -> Result<u32, String> {
     Ok(count)
 }
 
-pub fn bugfix_log_path(bod_dir: &Path) -> PathBuf {
-    bod_dir.join(BUGFIX_LOG)
+pub fn bugfix_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(BUGFIX_LOG)
 }
 
-pub fn ensure_gitignore(repo_root: &Path) -> Result<(), String> {
-    ensure_gitignore_entries(repo_root, &[".bod/", ".bodrc.toml"])
-}
-
-fn ensure_gitignore_entries(repo_root: &Path, entries: &[&str]) -> Result<(), String> {
-    let gitignore_path = repo_root.join(".gitignore");
-
-    let existing_lines: Vec<String> = if gitignore_path.exists() {
-        let file = fs::File::open(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {}", e))?;
-        let reader = std::io::BufReader::new(file);
-        reader
-            .lines()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read .gitignore: {}", e))?
-    } else {
-        Vec::new()
-    };
-
-    let mut to_add: Vec<&str> = Vec::new();
-    for entry in entries {
-        let base = entry.trim_matches('/');
-        let already = existing_lines.iter().any(|line| {
-            let t = line.trim();
-            let t_base = t.trim_matches('/');
-            t_base == base
-        });
-        if !already {
-            to_add.push(entry);
-        }
-    }
-
-    if to_add.is_empty() {
+fn migrate_legacy_state_dir(repo_root: &Path, state_dir: &Path) -> Result<(), String> {
+    let legacy_dir = paths::legacy_repo_state_dir(repo_root);
+    if !legacy_dir.exists() {
         return Ok(());
     }
 
-    if gitignore_path.exists() {
-        let content = fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {}", e))?;
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&gitignore_path)
-            .map_err(|e| format!("Failed to open .gitignore for writing: {}", e))?;
-        let prefix = if content.ends_with('\n') { "" } else { "\n" };
-        for (i, entry) in to_add.iter().enumerate() {
-            let p = if i == 0 { prefix } else { "" };
-            writeln!(file, "{}{}", p, entry)
-                .map_err(|e| format!("Failed to write to .gitignore: {}", e))?;
+    let mut migrated_any = false;
+    let entries = fs::read_dir(&legacy_dir).map_err(|e| {
+        format!(
+            "Failed to read legacy state directory {}: {}",
+            legacy_dir.display(),
+            e
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read legacy state entry: {}", e))?;
+        let file_type = entry.file_type().map_err(|e| {
+            format!(
+                "Failed to read file type for {}: {}",
+                entry.path().display(),
+                e
+            )
+        })?;
+        if !file_type.is_file() {
+            continue;
         }
-    } else {
-        let content: String = to_add.iter().map(|e| format!("{}\n", e)).collect();
-        fs::write(&gitignore_path, content)
-            .map_err(|e| format!("Failed to create .gitignore: {}", e))?;
+
+        let source = entry.path();
+        let destination = state_dir.join(entry.file_name());
+        if destination.exists() {
+            continue;
+        }
+
+        fs::copy(&source, &destination).map_err(|e| {
+            format!(
+                "Failed to migrate legacy state from {} to {}: {}",
+                source.display(),
+                destination.display(),
+                e
+            )
+        })?;
+        fs::remove_file(&source).map_err(|e| {
+            format!(
+                "Migrated {} but failed to remove legacy file {}: {}",
+                destination.display(),
+                source.display(),
+                e
+            )
+        })?;
+        migrated_any = true;
+    }
+
+    if is_dir_empty(&legacy_dir)? {
+        fs::remove_dir(&legacy_dir).map_err(|e| {
+            format!(
+                "Failed to remove empty legacy state directory {}: {}",
+                legacy_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    if migrated_any {
+        println!(
+            "Migrated legacy state from {} to {}",
+            legacy_dir.display(),
+            state_dir.display()
+        );
     }
 
     Ok(())
+}
+
+fn is_dir_empty(path: &Path) -> Result<bool, String> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|e| format!("Failed to read directory {}: {}", path.display(), e))?;
+    Ok(entries.next().is_none())
 }

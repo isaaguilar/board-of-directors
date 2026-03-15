@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::consolidate;
+use crate::copilot_cli;
 use crate::files;
 use crate::git;
 use crate::review;
@@ -7,7 +8,6 @@ use regex::Regex;
 use std::fmt;
 use std::path::Path;
 use std::time::Instant;
-use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SeverityLevel {
@@ -53,12 +53,15 @@ impl SeverityLevel {
     }
 }
 
-pub async fn run(timeout_secs: u64, severity: SeverityLevel, config: &Config) -> Result<(), String> {
+pub async fn run(
+    timeout_secs: u64,
+    severity: SeverityLevel,
+    config: &Config,
+) -> Result<(), String> {
     let repo_root = git::repo_root()?;
-    let bod_dir = files::ensure_bod_dir(&repo_root)?;
-    files::ensure_gitignore(&repo_root)?;
+    let state_dir = files::ensure_state_dir(&repo_root)?;
 
-    let log_path = files::bugfix_log_path(&bod_dir);
+    let log_path = files::bugfix_log_path(&state_dir);
     let included = severity.included_levels();
 
     println!(
@@ -77,7 +80,8 @@ pub async fn run(timeout_secs: u64, severity: SeverityLevel, config: &Config) ->
         if elapsed >= timeout_secs {
             println!(
                 "\n== Timeout reached ({} seconds). Stopping after {} iteration(s). ==",
-                timeout_secs, iteration - 1
+                timeout_secs,
+                iteration - 1
             );
             break;
         }
@@ -88,16 +92,24 @@ pub async fn run(timeout_secs: u64, severity: SeverityLevel, config: &Config) ->
             iteration, remaining
         );
 
-        // Step 1: Clean .bod/ (preserves bugfix.log.md)
-        let removed = files::clean_bod_dir(&bod_dir)?;
+        // Step 1: Clean generated review files in the external state dir (preserves bugfix.log.md)
+        let removed = files::clean_state_dir(&state_dir)?;
         if removed > 0 {
-            println!("  Cleaned {} old review file(s) from .bod/", removed);
+            println!(
+                "  Cleaned {} old review file(s) from {}",
+                removed,
+                state_dir.display()
+            );
         }
 
         // Step 2: Run multi-agent review
         println!("\n-- Step 1: Running multi-agent review --");
         if let Err(e) = review::run(config).await {
             eprintln!("  Review step failed: {}", e);
+            if e.is_fatal() {
+                eprintln!("  Fatal review setup error. Stopping.");
+                return Err(e.to_string());
+            }
             eprintln!("  Continuing to next iteration...");
             continue;
         }
@@ -109,7 +121,7 @@ pub async fn run(timeout_secs: u64, severity: SeverityLevel, config: &Config) ->
 
         // Step 3: Auto-consolidate
         println!("\n-- Step 2: Consolidating reviews --");
-        let report = match consolidate::run_auto(&bod_dir, &config.consolidate.model).await {
+        let report = match consolidate::run_auto(&state_dir, &config.consolidate.model).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("  Consolidation failed: {}", e);
@@ -146,6 +158,8 @@ pub async fn run(timeout_secs: u64, severity: SeverityLevel, config: &Config) ->
             total_actionable, config.bugfix.model
         );
         if let Err(e) = run_fix_agent(
+            &repo_root,
+            &state_dir,
             &report,
             &prior_log,
             &log_path,
@@ -258,6 +272,8 @@ fn extract_actionable(report: &str, severity: &SeverityLevel) -> String {
 }
 
 async fn run_fix_agent(
+    repo_root: &Path,
+    state_dir: &Path,
     report: &str,
     prior_log: &str,
     log_path: &Path,
@@ -267,9 +283,7 @@ async fn run_fix_agent(
 ) -> Result<(), String> {
     let issues = extract_actionable(report, severity);
     let log_path_str = log_path.to_string_lossy().to_string();
-    let levels_label = severity
-        .included_levels()
-        .join(", ");
+    let levels_label = severity.included_levels().join(", ");
 
     let history_section = if prior_log.is_empty() {
         "No prior fixes have been made yet. This is the first iteration.".to_string()
@@ -294,7 +308,11 @@ Your task:
 - Make precise, surgical changes. Do not refactor unrelated code.
 - Prioritize correctness. Every fix must be correct.
 - After making changes, verify they compile (run the project's build/check command).
-- Do NOT look at or modify any files in the .bod directory.
+- Never run git commands. Never create commits. Never push.
+- Treat all board-of-directors generated state as internal tooling artifacts, including any legacy `.bod*` repo files and files under `~/.config/board-of-directors/`.
+- Do NOT inspect or use that tooling state as repository source material.
+- The only allowed interaction with tooling state is appending the required summary to the fix log below.
+- Do NOT create new documentation files or write documentation from scratch unless editing an existing doc is directly required to complete a correctness fix.
 - Do NOT create new test files unless a fix specifically requires one.
 
 {history_section}
@@ -319,15 +337,7 @@ For each fix, write:
 "#
     );
 
-    let output = Command::new("copilot")
-        .args([
-            "-p",
-            &prompt,
-            "--model",
-            fix_model,
-            "--allow-all",
-            "--autopilot",
-        ])
+    let output = copilot_cli::command(&prompt, fix_model, repo_root, state_dir)
         .output()
         .await
         .map_err(|e| format!("Failed to start fix agent: {}", e))?;

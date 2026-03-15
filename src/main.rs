@@ -2,9 +2,11 @@ mod agents;
 mod bugfix;
 mod config;
 mod consolidate;
+mod copilot_cli;
 mod files;
 mod git;
 mod init;
+mod paths;
 mod review;
 
 use clap::{Parser, Subcommand};
@@ -58,7 +60,11 @@ async fn main() {
     }
 
     // Init: global mode doesn't need a git repo, local mode does
-    if let Commands::Init { global, reconfigure } = &cli.command {
+    if let Commands::Init {
+        global,
+        reconfigure,
+    } = &cli.command
+    {
         let repo_root = if *global {
             None
         } else {
@@ -89,7 +95,7 @@ async fn main() {
     let config = config::load(&repo_root);
 
     let result = match cli.command {
-        Commands::Review => review::run(&config).await,
+        Commands::Review => review::run(&config).await.map_err(|e| e.to_string()),
         Commands::Consolidate => consolidate::run(&config).await,
         Commands::Bugfix { timeout, severity } => {
             match bugfix::SeverityLevel::from_str(&severity) {

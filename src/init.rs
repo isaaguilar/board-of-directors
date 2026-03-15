@@ -1,5 +1,4 @@
 use crate::config::{self, BugfixConfig, Config, ConsolidateConfig, ModelEntry, ReviewConfig};
-use crate::files;
 use regex::Regex;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -8,7 +7,7 @@ use std::process::Command;
 /// Run `bod init`.
 /// - `global`: write to ~/.config/board-of-directors/.bodrc.toml
 /// - `reconfigure`: skip the "overwrite?" prompt
-/// - `repo_root`: required when `global` is false (local mode)
+/// - `repo_root`: required when `global` is false (repo-scoped config, stored outside the repo)
 pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<(), String> {
     let (config_exists, config_path_display, load_existing): (
         bool,
@@ -21,10 +20,15 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
             Box::new(config::load_global),
         )
     } else {
-        let root = repo_root.ok_or("Not inside a git repository. Use --global for global config.")?;
+        let root =
+            repo_root.ok_or("Not inside a git repository. Use --global for global config.")?;
+        let existing_path = config::existing_local_config_path(root);
         (
-            config::local_config_exists(root),
-            config::local_config_path(root).display().to_string(),
+            existing_path.is_some(),
+            existing_path
+                .unwrap_or_else(|| config::local_config_path(root))
+                .display()
+                .to_string(),
             {
                 let root = root.to_path_buf();
                 Box::new(move || try_load_local(&root).unwrap_or_default())
@@ -62,10 +66,8 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
         let idx = prompt_model_choice(&format!("Review model #{}", i), &models)?;
         let model = &models[idx];
         let default_cn = derive_codename(model, &used_codenames);
-        let codename = prompt_string_with_default(
-            &format!("Codename for '{}'", model),
-            &default_cn,
-        )?;
+        let codename =
+            prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
         used_codenames.push(codename.clone());
         review_models.push(ModelEntry {
             codename,
@@ -108,7 +110,6 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
     } else {
         let root = repo_root.unwrap();
         config::write_local(&new_config, root)?;
-        files::ensure_gitignore(root)?;
         println!("Saved to {}", config::local_config_path(root).display());
     }
 
@@ -116,14 +117,25 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
 }
 
 fn try_load_local(repo_root: &Path) -> Option<Config> {
-    let path = config::local_config_path(repo_root);
-    if !path.exists() {
-        return None;
+    for path in [
+        config::local_config_path(repo_root),
+        config::legacy_local_config_path(repo_root),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                if let Ok(config) = toml::from_str::<Config>(&content) {
+                    return Some(config);
+                }
+            }
+            Err(_) => continue,
+        }
     }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => toml::from_str::<Config>(&content).ok(),
-        Err(_) => None,
-    }
+
+    None
 }
 
 fn print_config(config: &Config) {
@@ -189,7 +201,9 @@ fn fallback_models() -> Vec<String> {
 
 fn prompt_yes_no(question: &str) -> Result<bool, String> {
     print!("{} (y/n): ", question);
-    io::stdout().flush().map_err(|e| format!("IO error: {}", e))?;
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
     io::stdin()
@@ -204,7 +218,9 @@ fn prompt_yes_no(question: &str) -> Result<bool, String> {
 fn prompt_model_choice(label: &str, models: &[String]) -> Result<usize, String> {
     loop {
         print!("{} (1-{}): ", label, models.len());
-        io::stdout().flush().map_err(|e| format!("IO error: {}", e))?;
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("IO error: {}", e))?;
 
         let mut input = String::new();
         io::stdin()
@@ -221,13 +237,19 @@ fn prompt_model_choice(label: &str, models: &[String]) -> Result<usize, String> 
             return Ok(n - 1);
         }
 
-        eprintln!("  Invalid choice '{}'. Enter a number from 1 to {}.", input, models.len());
+        eprintln!(
+            "  Invalid choice '{}'. Enter a number from 1 to {}.",
+            input,
+            models.len()
+        );
     }
 }
 
 fn prompt_string_with_default(label: &str, default: &str) -> Result<String, String> {
     print!("{} [{}]: ", label, default);
-    io::stdout().flush().map_err(|e| format!("IO error: {}", e))?;
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
     io::stdin()
@@ -246,7 +268,11 @@ fn prompt_string_with_default(label: &str, default: &str) -> Result<String, Stri
 /// Derive a short codename from a model ID, avoiding collisions with already-used names.
 fn derive_codename(model: &str, used: &[String]) -> String {
     let base = if model.contains("opus") {
-        if model.contains("fast") { "opus-fast" } else { "opus" }
+        if model.contains("fast") {
+            "opus-fast"
+        } else {
+            "opus"
+        }
     } else if model.contains("sonnet") {
         "sonnet"
     } else if model.contains("haiku") {

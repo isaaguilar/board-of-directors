@@ -1,22 +1,30 @@
 use crate::agents;
 use crate::config::Config;
+use crate::copilot_cli;
 use crate::files;
 use crate::git;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use tokio::process::Command;
 
 /// Interactive consolidation -- user picks which review files to consolidate.
 pub async fn run(config: &Config) -> Result<(), String> {
     let repo_root = git::repo_root()?;
-    let bod_dir = files::ensure_bod_dir(&repo_root)?;
+    let state_dir = files::ensure_state_dir(&repo_root)?;
 
-    let all_files = agents::list_review_files(&bod_dir);
+    let all_files = agents::list_review_files(&state_dir);
     if all_files.is_empty() {
-        return Err("No review files found in .bod/. Run 'bod review' first.".to_string());
+        return Err(format!(
+            "No review files found in {}. Run 'bod review' first.",
+            state_dir.display()
+        ));
     }
 
-    let codenames: Vec<String> = config.review.models.iter().map(|m| m.codename.clone()).collect();
+    let codenames: Vec<String> = config
+        .review
+        .models
+        .iter()
+        .map(|m| m.codename.clone())
+        .collect();
     let groups = agents::group_reviews_by_round(&all_files, &codenames);
     let mut round_keys: Vec<String> = groups.keys().cloned().collect();
     round_keys.sort();
@@ -71,11 +79,20 @@ pub async fn run(config: &Config) -> Result<(), String> {
 
     let branch = git::current_branch()?;
     let sanitized = agents::sanitize_branch_name(&branch);
-    let number = agents::next_consolidated_number(&bod_dir, &sanitized);
+    let number = agents::next_consolidated_number(&state_dir, &sanitized);
     let out_filename = agents::consolidated_filename(&sanitized, number);
-    let out_path = bod_dir.join(&out_filename);
+    let out_path = state_dir.join(&out_filename);
 
-    let stdout = run_consolidation(&bod_dir, &selected_files, &out_path, false, "", &config.consolidate.model).await?;
+    let stdout = run_consolidation(
+        &repo_root,
+        &state_dir,
+        &selected_files,
+        &out_path,
+        false,
+        "",
+        &config.consolidate.model,
+    )
+    .await?;
 
     // Write stdout as fallback if copilot didn't create the file via tool use
     if !out_path.exists() {
@@ -87,7 +104,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
             .map_err(|e| format!("Failed to write consolidated report: {}", e))?;
     }
 
-    println!("\nConsolidated report saved to: .bod/{}", out_filename);
+    println!("\nConsolidated report saved to: {}", out_path.display());
     Ok(())
 }
 
@@ -97,9 +114,10 @@ pub async fn run(config: &Config) -> Result<(), String> {
 pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String, String> {
     let all_files = agents::list_review_files(bod_dir);
     if all_files.is_empty() {
-        return Err("No review files found in .bod/.".to_string());
+        return Err(format!("No review files found in {}.", bod_dir.display()));
     }
 
+    let repo_root = git::repo_root()?;
     let branch = git::current_branch()?;
     let sanitized = agents::sanitize_branch_name(&branch);
     let number = agents::next_consolidated_number(bod_dir, &sanitized);
@@ -107,12 +125,21 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
     let out_path = bod_dir.join(&out_filename);
 
     // Read bugfix log if it exists so the consolidator knows what's been fixed
-    let log_path = crate::files::bugfix_log_path(bod_dir);
+    let log_path = files::bugfix_log_path(bod_dir);
     let bugfix_log = std::fs::read_to_string(&log_path).unwrap_or_default();
 
     println!("  Consolidating {} review file(s)...", all_files.len());
 
-    let stdout = run_consolidation(bod_dir, &all_files, &out_path, true, &bugfix_log, consolidate_model).await?;
+    let stdout = run_consolidation(
+        &repo_root,
+        bod_dir,
+        &all_files,
+        &out_path,
+        true,
+        &bugfix_log,
+        consolidate_model,
+    )
+    .await?;
 
     // Write stdout as fallback if copilot didn't create the file via tool use
     if !out_path.exists() {
@@ -130,7 +157,7 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
         .await
         .map_err(|e| format!("Failed to read consolidated report: {}", e))?;
 
-    println!("  Consolidated report: .bod/{}", out_filename);
+    println!("  Consolidated report: {}", out_path.display());
     Ok(content)
 }
 
@@ -138,6 +165,7 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
 /// severity tags on each finding. `bugfix_log` provides prior fix history so the
 /// consolidator can mark resolved issues appropriately.
 async fn run_consolidation(
+    repo_root: &Path,
     bod_dir: &Path,
     files: &[String],
     out_path: &Path,
@@ -219,6 +247,10 @@ You have been given reviews from different AI agents who independently reviewed 
 4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first.
 
 Format as clean, readable markdown. Be concise and actionable.
+- Never run git commands. Never create commits. Never push.
+- Use the supplied review files and bugfix log only as tooling inputs for synthesis.
+- Do not treat their filenames, paths, or mere presence as repository defects.
+- Only write the requested consolidated report file.
 {severity_instruction}{bugfix_log_section}
 Write the complete consolidated report to: {out_path_str}
 
@@ -227,15 +259,7 @@ Here are the individual reviews:
 {reviews_content}"#
     );
 
-    let output = Command::new("copilot")
-        .args([
-            "-p",
-            &prompt,
-            "--model",
-            model,
-            "--allow-all",
-            "--autopilot",
-        ])
+    let output = copilot_cli::command(&prompt, model, repo_root, bod_dir)
         .output()
         .await
         .map_err(|e| format!("Failed to start copilot for consolidation: {}", e))?;
