@@ -1,6 +1,6 @@
 use crate::agents;
-use crate::config::Config;
-use crate::copilot_cli;
+use crate::backend;
+use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
 use std::io::{self, BufRead, Write};
@@ -10,6 +10,13 @@ use std::path::Path;
 pub async fn run(config: &Config) -> Result<(), String> {
     let repo_root = git::repo_root()?;
     let state_dir = files::ensure_state_dir(&repo_root)?;
+    let branch = git::current_branch()?;
+    let sanitized = agents::sanitize_branch_name(&branch).ok_or_else(|| {
+        format!(
+            "Branch name '{}' contains no alphanumeric characters and cannot be used for filenames.",
+            branch
+        )
+    })?;
 
     let all_files = agents::list_review_files(&state_dir);
     if all_files.is_empty() {
@@ -19,13 +26,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
         ));
     }
 
-    let codenames: Vec<String> = config
-        .review
-        .models
-        .iter()
-        .map(|m| m.codename.clone())
-        .collect();
-    let groups = agents::group_reviews_by_round(&all_files, &codenames);
+    let groups = agents::group_reviews_by_round(&all_files);
     let mut round_keys: Vec<String> = groups.keys().cloned().collect();
     round_keys.sort();
 
@@ -45,10 +46,13 @@ pub async fn run(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
-    io::stdin()
+    let bytes = io::stdin()
         .lock()
         .read_line(&mut input)
         .map_err(|e| format!("Failed to read input: {}", e))?;
+    if bytes == 0 {
+        return Err("Unexpected end of input".to_string());
+    }
 
     let input = input.trim();
     let selected_files: Vec<String> = if input == "a" || input == "A" {
@@ -78,10 +82,12 @@ pub async fn run(config: &Config) -> Result<(), String> {
     println!("\nConsolidating {} review file(s)...", selected_files.len());
 
     write_selected_reviews(
+        &config.backend,
         &repo_root,
         &state_dir,
         &selected_files,
         &config.consolidate.model,
+        &sanitized,
     )
     .await
 }
@@ -99,7 +105,12 @@ pub async fn run_latest(config: &Config) -> Result<(), String> {
     }
 
     let branch = git::current_branch()?;
-    let sanitized = agents::sanitize_branch_name(&branch);
+    let sanitized = agents::sanitize_branch_name(&branch).ok_or_else(|| {
+        format!(
+            "Branch name '{}' contains no alphanumeric characters and cannot be used for filenames.",
+            branch
+        )
+    })?;
     let codenames: Vec<String> = config
         .review
         .models
@@ -123,27 +134,31 @@ pub async fn run_latest(config: &Config) -> Result<(), String> {
     );
 
     write_selected_reviews(
+        &config.backend,
         &repo_root,
         &state_dir,
         &selected_files,
         &config.consolidate.model,
+        &sanitized,
     )
     .await
 }
 
 async fn write_selected_reviews(
+    backend: &Backend,
     repo_root: &Path,
     state_dir: &Path,
     selected_files: &[String],
     model: &str,
+    sanitized_branch: &str,
 ) -> Result<(), String> {
-    let branch = git::current_branch()?;
-    let sanitized = agents::sanitize_branch_name(&branch);
-    let number = agents::next_consolidated_number(&state_dir, &sanitized);
-    let out_filename = agents::consolidated_filename(&sanitized, number);
+    let timestamp = agents::timestamp_now();
+    let (out_filename, mut guard) = agents::create_consolidated_file(&state_dir, sanitized_branch, &timestamp)
+        .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
     let out_path = state_dir.join(&out_filename);
 
     let stdout = run_consolidation(
+        backend,
         &repo_root,
         &state_dir,
         &selected_files,
@@ -154,34 +169,63 @@ async fn write_selected_reviews(
     )
     .await?;
 
-    // Write stdout as fallback if copilot didn't create the file via tool use
-    if !out_path.exists() {
-        if stdout.trim().is_empty() {
+    // Check file size, not just existence, in case the agent created a 0-byte file.
+    let meta = tokio::fs::metadata(&out_path).await.ok();
+    let file_is_empty = meta.map_or(true, |m| m.len() == 0);
+    if file_is_empty {
+        let clean = backend::strip_ansi_codes(&stdout);
+        if clean.trim().is_empty() {
             return Err("Consolidation produced no output.".to_string());
         }
-        tokio::fs::write(&out_path, stdout.as_bytes())
+        tokio::fs::write(&out_path, clean.as_bytes())
             .await
             .map_err(|e| format!("Failed to write consolidated report: {}", e))?;
+    }
+
+    // File has valid content -- disarm before optional ANSI read-back.
+    guard.disarm();
+
+    // Strip ANSI codes from agent-written content (mirrors run_auto).
+    let raw = tokio::fs::read_to_string(&out_path)
+        .await
+        .map_err(|e| format!("Failed to read consolidated report: {}", e))?;
+    let content = backend::strip_ansi_codes(&raw);
+    if content != raw {
+        if let Err(e) = tokio::fs::write(&out_path, content.as_bytes()).await {
+            eprintln!("Warning: failed to rewrite ANSI-cleaned report: {}", e);
+        }
     }
 
     println!("\nConsolidated report saved to: {}", out_path.display());
     Ok(())
 }
 
-/// Non-interactive consolidation -- auto-selects all review files.
+/// Non-interactive consolidation -- scoped to a specific review round.
 /// Uses severity-tagged prompt for bugfix parsing.
+/// When `review_timestamp` is provided, only review files from that round are included.
 /// Returns the report content as a string.
-pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String, String> {
-    let all_files = agents::list_review_files(bod_dir);
+pub async fn run_auto(
+    backend: &Backend,
+    bod_dir: &Path,
+    consolidate_model: &str,
+    review_timestamp: Option<&str>,
+    codenames: &[String],
+    repo_root: &Path,
+    sanitized_branch: &str,
+) -> Result<String, String> {
+    let all_files = match review_timestamp {
+        Some(ts) => agents::list_review_files_for_round_id(bod_dir, ts, Some(sanitized_branch), codenames),
+        None => agents::list_review_files(bod_dir),
+    };
     if all_files.is_empty() {
         return Err(format!("No review files found in {}.", bod_dir.display()));
     }
 
-    let repo_root = git::repo_root()?;
-    let branch = git::current_branch()?;
-    let sanitized = agents::sanitize_branch_name(&branch);
-    let number = agents::next_consolidated_number(bod_dir, &sanitized);
-    let out_filename = agents::consolidated_filename(&sanitized, number);
+    let timestamp = review_timestamp
+        .map(|ts| ts.to_string())
+        .unwrap_or_else(agents::timestamp_now);
+    let (out_filename, mut guard) = agents::create_consolidated_file(bod_dir, sanitized_branch, &timestamp)
+        .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
     let out_path = bod_dir.join(&out_filename);
 
     // Read bugfix log if it exists so the consolidator knows what's been fixed
@@ -191,7 +235,8 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
     println!("  Consolidating {} review file(s)...", all_files.len());
 
     let stdout = run_consolidation(
-        &repo_root,
+        backend,
+        repo_root,
         bod_dir,
         &all_files,
         &out_path,
@@ -201,21 +246,36 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
     )
     .await?;
 
-    // Write stdout as fallback if copilot didn't create the file via tool use
-    if !out_path.exists() {
-        if stdout.trim().is_empty() {
+    // Check file size, not just existence, in case the agent created a 0-byte file.
+    let meta = tokio::fs::metadata(&out_path).await.ok();
+    let file_is_empty = meta.map_or(true, |m| m.len() == 0);
+    if file_is_empty {
+        let clean = backend::strip_ansi_codes(&stdout);
+        if clean.trim().is_empty() {
             return Err("Consolidation produced no output.".to_string());
         }
-        tokio::fs::write(&out_path, stdout.as_bytes())
+        tokio::fs::write(&out_path, clean.as_bytes())
             .await
             .map_err(|e| format!("Failed to write consolidated report: {}", e))?;
     }
 
-    // Always read the file -- copilot may have written richer content via tool use
-    // than what appeared on stdout
-    let content = tokio::fs::read_to_string(&out_path)
+    // File has valid content at this point -- disarm before read-back.
+    guard.disarm();
+
+    // Always read the file -- the agent may have written richer content via tool use
+    // than what appeared on stdout. Strip ANSI codes in case the agent wrote them.
+    let raw = tokio::fs::read_to_string(&out_path)
         .await
         .map_err(|e| format!("Failed to read consolidated report: {}", e))?;
+    let content = backend::strip_ansi_codes(&raw);
+
+    // Write the cleaned content back to disk if ANSI stripping changed it,
+    // so the on-disk file is always clean markdown.
+    if content != raw {
+        tokio::fs::write(&out_path, content.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to re-write cleaned consolidated report: {}", e))?;
+    }
 
     println!("  Consolidated report: {}", out_path.display());
     Ok(content)
@@ -225,6 +285,7 @@ pub async fn run_auto(bod_dir: &Path, consolidate_model: &str) -> Result<String,
 /// severity tags on each finding. `bugfix_log` provides prior fix history so the
 /// consolidator can mark resolved issues appropriately.
 async fn run_consolidation(
+    backend: &Backend,
     repo_root: &Path,
     bod_dir: &Path,
     files: &[String],
@@ -236,8 +297,9 @@ async fn run_consolidation(
     let mut reviews_content = String::new();
     for filename in files {
         let path = bod_dir.join(filename);
-        let content = std::fs::read_to_string(&path)
+        let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", filename, e))?;
+        let content = backend::strip_ansi_codes(&raw);
         reviews_content.push_str(&format!(
             "\n--- Review from {} ---\n{}\n",
             filename, content
@@ -321,14 +383,21 @@ Here are the individual reviews:
 {reviews_content}"#
     );
 
-    let output = copilot_cli::command(&prompt, model, repo_root, bod_dir)
-        .output()
+    let output = backend::run_agent(backend, &prompt, model, repo_root, bod_dir)
         .await
-        .map_err(|e| format!("Failed to start copilot for consolidation: {}", e))?;
+        .map_err(|e| {
+            if backend::is_arg_too_long(&e) {
+                "Prompt exceeds OS argument-size limit (E2BIG). \
+                 The diff may be too large for command-line passing. \
+                 Consider reviewing a smaller changeset.".to_string()
+            } else {
+                format!("Failed to start agent for consolidation: {}", e)
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Consolidation copilot failed: {}", stderr));
+        return Err(format!("Consolidation agent failed: {}", stderr));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

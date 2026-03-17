@@ -1,4 +1,7 @@
-use crate::config::{self, BugfixConfig, Config, ConsolidateConfig, ModelEntry, ReviewConfig};
+use crate::claude_cli;
+use crate::config::{
+    self, Backend, BugfixConfig, Config, ConsolidateConfig, ModelEntry, ReviewConfig,
+};
 use regex::Regex;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -46,7 +49,16 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
         println!();
     }
 
-    let models = discover_models()?;
+    // Pick backend first (determines available models)
+    println!("-- Backend --");
+    let backend = prompt_backend()?;
+    if backend == Backend::ClaudeCode {
+        println!();
+        claude_cli::print_permissions_warning();
+    }
+    println!();
+
+    let models = discover_models_for_backend(&backend)?;
     println!("Available models:\n");
     for (i, model) in models.iter().enumerate() {
         println!("  [{}] {}", i + 1, model);
@@ -64,6 +76,15 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
         let default_cn = derive_codename(model, &used_codenames);
         let codename =
             prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
+        // Sanitize codename: only allow filesystem-safe characters [a-zA-Z0-9_-].
+        let codename = sanitize_codename(&codename)?;
+        if codename == "consolidated" || codename.starts_with("consolidated-") {
+            return Err(format!(
+                "Codename '{}' is reserved (conflicts with consolidated report filenames). \
+                 Choose a different codename.",
+                codename
+            ));
+        }
         used_codenames.push(codename.clone());
         review_models.push(ModelEntry {
             codename,
@@ -85,6 +106,7 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
     println!();
 
     let new_config = Config {
+        backend,
         review: ReviewConfig {
             models: review_models,
         },
@@ -131,6 +153,7 @@ fn try_load_local(repo_root: &Path) -> Option<Config> {
 }
 
 fn print_config(config: &Config) {
+    println!("  Backend:     {}", config.backend);
     println!("  Review models:");
     for m in &config.review.models {
         println!("    {} -> {}", m.codename, m.model);
@@ -139,8 +162,86 @@ fn print_config(config: &Config) {
     println!("  Bugfix:        {}", config.bugfix.model);
 }
 
+fn prompt_backend() -> Result<Backend, String> {
+    println!("Which CLI backend should bod use?\n");
+    println!("  [1] Copilot CLI  (copilot)");
+    println!("  [2] Claude Code  (claude)\n");
+
+    loop {
+        print!("Backend (1-2): ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("IO error: {}", e))?;
+
+        let mut input = String::new();
+        let bytes = io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read input: {}", e))?;
+        if bytes == 0 {
+            return Err("Unexpected end of input".to_string());
+        }
+
+        match input.trim() {
+            "1" => {
+                println!("  -> Copilot CLI");
+                return Ok(Backend::Copilot);
+            }
+            "2" => {
+                println!("  -> Claude Code");
+                return Ok(Backend::ClaudeCode);
+            }
+            other => {
+                eprintln!("  Invalid choice '{}'. Enter 1 or 2.", other);
+            }
+        }
+    }
+}
+
+/// Discover models appropriate for the selected backend.
+fn discover_models_for_backend(backend: &Backend) -> Result<Vec<String>, String> {
+    match backend {
+        Backend::Copilot => discover_copilot_models(),
+        Backend::ClaudeCode => {
+            // Verify the claude binary is installed before proceeding
+            let version_check = Command::new("claude")
+                .arg("--version")
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "Failed to run 'claude --version': {}. \
+                         Is the Claude Code CLI installed?",
+                        e
+                    )
+                })?;
+            if !version_check.status.success() {
+                return Err(
+                    "The 'claude' CLI is installed but 'claude --version' failed. \
+                     Please verify your Claude Code installation."
+                        .to_string(),
+                );
+            }
+
+            // Verify required flags are supported using the same logic as the
+            // async check in claude_cli::verify_disallowed_tools_support().
+            let help_output = Command::new("claude")
+                .arg("--help")
+                .output()
+                .map_err(|e| format!("Failed to run 'claude --help': {}", e))?;
+            let help_stdout = String::from_utf8_lossy(&help_output.stdout);
+            let help_stderr = String::from_utf8_lossy(&help_output.stderr);
+            claude_cli::check_required_flags(&help_stdout, &help_stderr)?;
+
+            Ok(config::claude_code_model_ids()
+                .iter()
+                .map(|s| s.to_string())
+                .collect())
+        }
+    }
+}
+
 /// Discover models by parsing `copilot --help`.
-fn discover_models() -> Result<Vec<String>, String> {
+fn discover_copilot_models() -> Result<Vec<String>, String> {
     println!("Discovering available models from copilot...\n");
 
     let output = Command::new("copilot")
@@ -150,13 +251,11 @@ fn discover_models() -> Result<Vec<String>, String> {
 
     let help_text = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // The model list appears like: --model <model>  ... (choices: "model1", "model2", ...)
-    // It may span multiple lines between the opening ( and closing )
     let models = parse_model_choices(&help_text);
 
     if models.is_empty() {
         eprintln!("Warning: could not parse models from copilot --help. Using fallback list.");
-        return Ok(fallback_models());
+        return Ok(fallback_copilot_models());
     }
 
     Ok(models)
@@ -178,7 +277,7 @@ fn parse_model_choices(help_text: &str) -> Vec<String> {
     Vec::new()
 }
 
-fn fallback_models() -> Vec<String> {
+fn fallback_copilot_models() -> Vec<String> {
     vec![
         "claude-opus-4.6".to_string(),
         "claude-sonnet-4.6".to_string(),
@@ -198,10 +297,13 @@ fn prompt_yes_no(question: &str) -> Result<bool, String> {
         .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
-    io::stdin()
+    let bytes = io::stdin()
         .lock()
         .read_line(&mut input)
         .map_err(|e| format!("Failed to read input: {}", e))?;
+    if bytes == 0 {
+        return Err("Unexpected end of input".to_string());
+    }
 
     let answer = input.trim().to_lowercase();
     Ok(answer == "y" || answer == "yes")
@@ -215,10 +317,13 @@ fn prompt_model_choice(label: &str, models: &[String]) -> Result<usize, String> 
             .map_err(|e| format!("IO error: {}", e))?;
 
         let mut input = String::new();
-        io::stdin()
+        let bytes = io::stdin()
             .lock()
             .read_line(&mut input)
             .map_err(|e| format!("Failed to read input: {}", e))?;
+        if bytes == 0 {
+            return Err("Unexpected end of input".to_string());
+        }
 
         let input = input.trim();
         if let Ok(n) = input.parse::<usize>()
@@ -244,10 +349,13 @@ fn prompt_string_with_default(label: &str, default: &str) -> Result<String, Stri
         .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
-    io::stdin()
+    let bytes = io::stdin()
         .lock()
         .read_line(&mut input)
         .map_err(|e| format!("Failed to read input: {}", e))?;
+    if bytes == 0 {
+        return Err("Unexpected end of input".to_string());
+    }
 
     let val = input.trim();
     if val.is_empty() {
@@ -255,6 +363,24 @@ fn prompt_string_with_default(label: &str, default: &str) -> Result<String, Stri
     } else {
         Ok(val.to_string())
     }
+}
+
+/// Sanitize a codename to contain only filesystem-safe characters `[a-zA-Z0-9_-]`.
+/// Rejects codenames that produce an empty string after sanitization (e.g. `../../tmp`).
+fn sanitize_codename(raw: &str) -> Result<String, String> {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    let sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.is_empty() || !sanitized.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "Codename '{}' contains no valid characters. \
+             Codenames must have at least one alphanumeric character.",
+            raw
+        ));
+    }
+    Ok(sanitized)
 }
 
 /// Derive a short codename from a model ID, avoiding collisions with already-used names.

@@ -1,6 +1,7 @@
-use crate::config::Config;
+use crate::agents;
+use crate::backend;
+use crate::config::{Backend, Config};
 use crate::consolidate;
-use crate::copilot_cli;
 use crate::files;
 use crate::git;
 use crate::review;
@@ -60,6 +61,13 @@ pub async fn run(
 ) -> Result<(), String> {
     let repo_root = git::repo_root()?;
     let state_dir = files::ensure_state_dir(&repo_root)?;
+    let branch = git::current_branch()?;
+    let sanitized_branch = agents::sanitize_branch_name(&branch).ok_or_else(|| {
+        format!(
+            "Branch name '{}' contains no alphanumeric characters and cannot be used for filenames.",
+            branch
+        )
+    })?;
 
     let log_path = files::bugfix_log_path(&state_dir);
     let included = severity.included_levels();
@@ -92,36 +100,48 @@ pub async fn run(
             iteration, remaining
         );
 
-        // Step 1: Clean generated review files in the external state dir (preserves bugfix.log.md)
-        let removed = files::clean_state_dir(&state_dir)?;
-        if removed > 0 {
-            println!(
-                "  Cleaned {} old review file(s) from {}",
-                removed,
-                state_dir.display()
-            );
+        // Periodic cleanup: keep only the last 10 rounds of review files
+        if let Err(e) = agents::cleanup_old_rounds(&state_dir, 10) {
+            eprintln!("Warning: failed to clean up old review files: {}", e);
         }
 
-        // Step 2: Run multi-agent review
+        // Step 1: Run multi-agent review
         println!("\n-- Step 1: Running multi-agent review --");
-        if let Err(e) = review::run(config).await {
-            eprintln!("  Review step failed: {}", e);
-            if e.is_fatal() {
-                eprintln!("  Fatal review setup error. Stopping.");
-                return Err(e.to_string());
+        let review_timestamp = match review::run(config).await {
+            Ok(ts) => ts,
+            Err(e) => {
+                eprintln!("  Review step failed: {}", e);
+                if e.is_fatal() {
+                    eprintln!("  Fatal review setup error. Stopping.");
+                    return Err(e.to_string());
+                }
+                match e.timestamp {
+                    Some(ts) => {
+                        eprintln!("  Partial review success -- consolidating available reviews.");
+                        ts
+                    }
+                    None => {
+                        eprintln!("  Continuing to next iteration...");
+                        continue;
+                    }
+                }
             }
-            eprintln!("  Continuing to next iteration...");
-            continue;
-        }
+        };
 
         if start.elapsed().as_secs() >= timeout_secs {
             println!("\n== Timeout reached after review step. Stopping. ==");
             break;
         }
 
-        // Step 3: Auto-consolidate
+        // Step 2: Auto-consolidate (scoped to the current review round)
         println!("\n-- Step 2: Consolidating reviews --");
-        let report = match consolidate::run_auto(&state_dir, &config.consolidate.model).await {
+        let codenames: Vec<String> = config
+            .review
+            .models
+            .iter()
+            .map(|m| m.codename.clone())
+            .collect();
+        let report = match consolidate::run_auto(&config.backend, &state_dir, &config.consolidate.model, Some(&review_timestamp), &codenames, &repo_root, &sanitized_branch).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("  Consolidation failed: {}", e);
@@ -130,7 +150,7 @@ pub async fn run(
             }
         };
 
-        // Step 4: Count issues at or above the severity threshold
+        // Step 3: Count issues at or above the severity threshold
         let counts = count_severities(&report, &included);
         let total_actionable: u32 = counts.iter().map(|(_, c)| c).sum();
 
@@ -158,6 +178,7 @@ pub async fn run(
             total_actionable, config.bugfix.model
         );
         if let Err(e) = run_fix_agent(
+            &config.backend,
             &repo_root,
             &state_dir,
             &report,
@@ -272,6 +293,7 @@ fn extract_actionable(report: &str, severity: &SeverityLevel) -> String {
 }
 
 async fn run_fix_agent(
+    backend: &Backend,
     repo_root: &Path,
     state_dir: &Path,
     report: &str,
@@ -339,10 +361,17 @@ For each fix, write:
 "#
     );
 
-    let output = copilot_cli::command(&prompt, fix_model, repo_root, state_dir)
-        .output()
+    let output = backend::run_agent(backend, &prompt, fix_model, repo_root, state_dir)
         .await
-        .map_err(|e| format!("Failed to start fix agent: {}", e))?;
+        .map_err(|e| {
+            if backend::is_arg_too_long(&e) {
+                "Prompt exceeds OS argument-size limit (E2BIG). \
+                 The diff may be too large for command-line passing. \
+                 Consider reviewing a smaller changeset.".to_string()
+            } else {
+                format!("Failed to start fix agent: {}", e)
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

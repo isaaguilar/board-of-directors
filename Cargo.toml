@@ -1,6 +1,6 @@
 [package]
 name = "board-of-directors"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -8,8 +8,14 @@ name = "bod"
 path = "src/main.rs"
 
 [dependencies]
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["process", "fs", "rt-multi-thread", "macros", "io-util"] }
+getrandom = "0.4"
+tokio = { version = "1", features = ["process", "fs", "rt-multi-thread", "macros", "io-util", "time"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+strip-ansi-escapes = "0.2"
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

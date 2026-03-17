@@ -1,5 +1,7 @@
 mod agents;
+mod backend;
 mod bugfix;
+mod claude_cli;
 mod config;
 mod consolidate;
 mod copilot_cli;
@@ -101,10 +103,30 @@ async fn main() {
         }
     };
 
-    let config = config::load(&repo_root);
+    let mut config = config::load(&repo_root);
+    config::normalize_models_for_backend(&mut config);
+    if let Err(e) = config::validate_models_for_backend(&config) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
+    // Only run Claude-specific safety checks for commands that actually invoke agents.
+    // This avoids spurious stderr output and subprocess calls for non-agent commands
+    // like `bod version` or `bod init`.
+    let needs_agent = matches!(
+        cli.command,
+        Commands::Review { .. } | Commands::Consolidate | Commands::Bugfix { .. }
+    );
+    if needs_agent && config.backend == config::Backend::ClaudeCode {
+        if let Err(e) = claude_cli::verify_disallowed_tools_support().await {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        claude_cli::print_permissions_warning();
+    }
 
     let result = match cli.command {
-        Commands::Review { command: None } => review::run(&config).await.map_err(|e| e.to_string()),
+        Commands::Review { command: None } => review::run(&config).await.map(|_| ()).map_err(|e| e.to_string()),
         Commands::Review {
             command: Some(ReviewCommands::Consolidate),
         } => consolidate::run_latest(&config).await,
