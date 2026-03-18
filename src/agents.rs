@@ -1,3 +1,4 @@
+use crate::files;
 use chrono::Local;
 use regex::Regex;
 use std::collections::HashMap;
@@ -221,7 +222,7 @@ pub fn create_consolidated_file(
 }
 
 /// Remove review files older than the most recent `keep` rounds.
-/// Never removes `bugfix.log.md` or consolidated reports.
+/// Never removes bugfix logs or consolidated reports.
 ///
 /// Consolidated reports are preserved because they are the useful synthesis output;
 /// removing them would lose the human-readable summary while the raw reviews are
@@ -235,7 +236,7 @@ pub fn cleanup_old_rounds(
     bod_dir: &Path,
     keep: usize,
 ) -> Result<u32, String> {
-    // Collect all timestamped review .md files, excluding consolidated reports and bugfix log.
+    // Collect all timestamped review .md files, excluding consolidated reports and bugfix logs.
     // Consolidated reports share the same round prefix as their source reviews but should
     // be preserved -- they are the useful synthesis output.
     let mut files_with_ts: Vec<(String, String)> = Vec::new();
@@ -244,7 +245,7 @@ pub fn cleanup_old_rounds(
         .map_err(|e| format!("Failed to read directory {}: {}", bod_dir.display(), e))?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".md") && name != "bugfix.log.md" && !is_consolidated_file(&name) {
+        if name.ends_with(".md") && !files::is_bugfix_log(&name) && !is_consolidated_file(&name) {
             let stem = name.strip_suffix(".md").unwrap_or(&name);
             if let Some((round_id, rest)) = split_round_prefix(stem) {
                 // Only collect files matching the review naming structure
@@ -475,7 +476,7 @@ fn is_consolidated_file(filename: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// List all review .md files in the state directory, excluding consolidated reports and bugfix log.
+/// List all review .md files in the state directory, excluding consolidated reports and bugfix logs.
 pub fn list_review_files(bod_dir: &Path) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
 
@@ -484,7 +485,7 @@ pub fn list_review_files(bod_dir: &Path) -> Vec<String> {
             let name = entry.file_name();
             let name = name.to_string_lossy().to_string();
             if name.ends_with(".md")
-                && name != "bugfix.log.md"
+                && !files::is_bugfix_log(&name)
                 && !is_consolidated_file(&name)
             {
                 files.push(name);
@@ -824,7 +825,7 @@ mod tests {
     #[test]
     fn extract_timestamp_invalid() {
         assert_eq!(extract_timestamp("opus-feature-1.md"), None);
-        assert_eq!(extract_timestamp("bugfix.log.md"), None);
+        assert_eq!(extract_timestamp("bugfix-feature.log.md"), None);
     }
 
     #[test]
@@ -889,7 +890,7 @@ mod tests {
     #[test]
     fn is_consolidated_file_false() {
         assert!(!is_consolidated_file("20260316153045-opus-feature.md"));
-        assert!(!is_consolidated_file("bugfix.log.md"));
+        assert!(!is_consolidated_file("bugfix-feature.log.md"));
     }
 
     #[test]
@@ -925,7 +926,7 @@ mod tests {
             "",
         )
         .unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         let files = list_review_files(dir.path());
         assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
@@ -1064,7 +1065,7 @@ mod tests {
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("opus-feature-1.md"), "").unwrap();
         // bugfix log should never be removed
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // Legacy files are no longer cleaned up (ambiguous naming pattern).
         // Only the timestamped round exists; keep=1 means nothing is removed.
@@ -1073,7 +1074,7 @@ mod tests {
         assert!(dir.path().join("20260316153045-opus-feature.md").exists());
         // Legacy file is preserved (not eligible for cleanup)
         assert!(dir.path().join("opus-feature-1.md").exists());
-        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1081,14 +1082,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("opus-feature-1.md"), "").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=10: only 1 timestamped round, well within keep limit.
         let removed = cleanup_old_rounds(dir.path(), 10).unwrap();
         assert_eq!(removed, 0);
         assert!(dir.path().join("20260316153045-opus-feature.md").exists());
         assert!(dir.path().join("opus-feature-1.md").exists());
-        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1097,7 +1098,7 @@ mod tests {
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("20260316200015-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("opus-feature-1.md"), "").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=0 removes all timestamped rounds; legacy files are preserved.
         let removed = cleanup_old_rounds(dir.path(), 0).unwrap();
@@ -1107,7 +1108,7 @@ mod tests {
         // Legacy file is preserved (not eligible for cleanup)
         assert!(dir.path().join("opus-feature-1.md").exists());
         // bugfix log is never removed
-        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1116,7 +1117,7 @@ mod tests {
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("consolidated-feature.md"), "").unwrap();
         fs::write(dir.path().join("consolidated-main.md"), "").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=1: only the timestamped round exists; nothing to evict.
         let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
@@ -1124,7 +1125,7 @@ mod tests {
         assert!(dir.path().join("20260316153045-opus-feature.md").exists());
         assert!(dir.path().join("consolidated-feature.md").exists());
         assert!(dir.path().join("consolidated-main.md").exists());
-        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1136,7 +1137,7 @@ mod tests {
         // Timestamped consolidated reports sharing the same round prefix
         fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
         fs::write(dir.path().join("20260316200015-consolidated-feature.md"), "").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=1: evict the oldest round's reviews but preserve consolidated reports.
         let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
@@ -1146,7 +1147,7 @@ mod tests {
         // Both consolidated reports are preserved
         assert!(dir.path().join("20260316153045-consolidated-feature.md").exists());
         assert!(dir.path().join("20260316200015-consolidated-feature.md").exists());
-        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1185,7 +1186,7 @@ mod tests {
         fs::write(dir.path().join("20260316153045-notes.md"), "my notes").unwrap();
         // User-created file with timestamp and single segment (no second dash)
         fs::write(dir.path().join("20260316153045-scratch.md"), "scratch").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=1: evicts oldest review round but preserves user files
         let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
@@ -1206,6 +1207,33 @@ mod tests {
 
         let files = list_review_files(dir.path());
         assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
+    }
+
+    #[test]
+    fn list_review_files_excludes_both_bugfix_log_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "review").unwrap();
+        // Both the legacy and branch-scoped bugfix logs must be excluded.
+        fs::write(dir.path().join("bugfix.log.md"), "legacy log").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "branch log").unwrap();
+
+        let files = list_review_files(dir.path());
+        assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
+    }
+
+    #[test]
+    fn cleanup_old_rounds_preserves_both_bugfix_log_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316200015-opus-feature.md"), "").unwrap();
+        // Both bugfix log forms must survive cleanup.
+        fs::write(dir.path().join("bugfix.log.md"), "legacy").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "branch").unwrap();
+
+        let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
+        assert_eq!(removed, 1);
+        assert!(dir.path().join("bugfix.log.md").exists());
+        assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
     #[test]
@@ -1273,7 +1301,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "r1").unwrap();
         fs::write(dir.path().join("20260316200015-opus-feature.md"), "r2").unwrap();
-        fs::write(dir.path().join("bugfix.log.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         let codenames = vec!["opus".to_string()];
         let result = list_review_files_for_round_id(

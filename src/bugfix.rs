@@ -69,7 +69,8 @@ pub async fn run(
         )
     })?;
 
-    let log_path = files::bugfix_log_path(&state_dir);
+    let log_path = files::bugfix_log_path(&state_dir, &sanitized_branch)
+        .map_err(|e| format!("Invalid branch for bugfix log path: {}", e))?;
     let included = severity.included_levels();
 
     println!(
@@ -171,7 +172,7 @@ pub async fn run(
             break;
         }
 
-        let prior_log = read_log(&log_path);
+        let prior_log = files::read_bugfix_log_with_migration(&state_dir, &sanitized_branch)?;
 
         println!(
             "\n-- Step 3: Fixing {} issue(s) with {} --",
@@ -218,10 +219,6 @@ fn count_severities(report: &str, included: &[&str]) -> Vec<(String, u32)> {
             (level.to_string(), count)
         })
         .collect()
-}
-
-fn read_log(log_path: &Path) -> String {
-    std::fs::read_to_string(log_path).unwrap_or_default()
 }
 
 /// Extract findings at or above the severity threshold.

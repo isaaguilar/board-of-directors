@@ -228,9 +228,9 @@ pub async fn run_auto(
         .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
     let out_path = bod_dir.join(&out_filename);
 
-    // Read bugfix log if it exists so the consolidator knows what's been fixed
-    let log_path = files::bugfix_log_path(bod_dir);
-    let bugfix_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Read bugfix log for the current branch, migrating from the legacy
+    // global log if the branch-scoped file does not yet exist.
+    let bugfix_log = files::read_bugfix_log_with_migration(bod_dir, sanitized_branch)?;
 
     println!("  Consolidating {} review file(s)...", all_files.len());
 
