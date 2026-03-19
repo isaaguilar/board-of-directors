@@ -77,6 +77,7 @@ enum ManualStartOutcome {
 
 pub async fn run(
     timeout_secs: u64,
+    max_iterations: Option<u32>,
     severity: SeverityLevel,
     config: &Config,
     cli_prompt: Option<&str>,
@@ -191,6 +192,19 @@ pub async fn run(
                 timeout_secs, iteration
             );
             break;
+        }
+
+        if let Some(max) = max_iterations {
+            if iteration >= max {
+                session
+                    .mark_completed(format!("Iteration limit reached after {} iteration(s).", iteration))
+                    .await;
+                println!(
+                    "\n== Iteration limit ({}) reached. Stopping. ==",
+                    max
+                );
+                break;
+            }
         }
 
         iteration += 1;

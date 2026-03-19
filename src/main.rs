@@ -41,6 +41,9 @@ enum Commands {
         /// Maximum runtime in seconds (soft timeout -- finishes current step)
         #[arg(long, default_value_t = 3600)]
         timeout: u64,
+        /// Maximum number of fix iterations (exits early when no issues remain)
+        #[arg(long)]
+        iterations: Option<u32>,
         /// Minimum severity to fix: critical, high, medium, low
         #[arg(long, default_value = "high")]
         severity: String,
@@ -146,11 +149,12 @@ async fn main() {
         Commands::Consolidate => consolidate::run(&config).await,
         Commands::Bugfix {
             timeout,
+            iterations,
             severity,
             prompt,
             delay_start,
         } => match bugfix::SeverityLevel::from_str(&severity) {
-            Ok(level) => bugfix::run(timeout, level, &config, prompt.as_deref(), delay_start).await,
+            Ok(level) => bugfix::run(timeout, iterations, level, &config, prompt.as_deref(), delay_start).await,
             Err(e) => Err(e),
         },
         Commands::Init { .. } | Commands::Version => unreachable!(),
@@ -193,6 +197,32 @@ mod tests {
             cli.command,
             Commands::Bugfix {
                 delay_start: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_bugfix_iterations_flag() {
+        let cli = Cli::try_parse_from(["bod", "bugfix", "--iterations", "5"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Bugfix {
+                iterations: Some(5),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_bugfix_iterations_defaults_to_none() {
+        let cli = Cli::try_parse_from(["bod", "bugfix"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Bugfix {
+                iterations: None,
                 ..
             }
         ));
