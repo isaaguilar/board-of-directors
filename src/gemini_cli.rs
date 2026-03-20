@@ -49,9 +49,9 @@ pub fn command(
 pub fn print_permissions_warning() {
     eprintln!("Warning: Gemini CLI backend runs with --approval-mode yolo.");
     eprintln!("  Tool actions are auto-approved for non-interactive execution.");
-    eprintln!("  bod can enable Gemini sandboxing for fixer runs, but Gemini CLI does not expose");
-    eprintln!("  the same git-specific deny-list controls as Copilot or Claude.");
-    eprintln!("  Review agent output carefully, especially for fix runs.");
+    eprintln!("  Gemini's --sandbox provides extra containment but PATH-based sanitization cannot prevent");
+    eprintln!("  an agent from executing absolute-path binaries (e.g., /usr/bin/git) in child processes.");
+    eprintln!("  For stronger isolation run agents inside OS-level sandboxes (containers, seccomp, namespaces) and review agent output carefully.");
 }
 
 pub const REQUIRED_CLI_FLAGS: &[&str] = &[

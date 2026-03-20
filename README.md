@@ -69,6 +69,7 @@ Mitigations:
 - **Claude Code backend should be used only in sandboxed or trusted-code-only environments** due to the inherent limitations of tool-deny patterns.
 - **Gemini CLI backend should be used only in sandboxed or trusted-code-only environments** until it exposes stronger non-interactive tool restrictions.
 - The Copilot CLI backend does not use this flag and is not affected.
+- Note: The PATH-based safe-bin and shim approach reduces risk but cannot prevent a child process from executing absolute-path binaries (e.g., /usr/bin/git) or other bypasses; for stronger containment run agents inside OS-level sandboxes (containers, seccomp, mount namespaces) or only on trusted hosts.
 
 ## State location
 
