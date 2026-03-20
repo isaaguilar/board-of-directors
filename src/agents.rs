@@ -526,6 +526,82 @@ pub fn list_review_files(bod_dir: &Path) -> Vec<String> {
     files
 }
 
+/// List timestamped review files produced by review rounds across all branches.
+pub fn list_timestamped_review_files(bod_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(bod_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if files::is_bugfix_log(&name) || is_consolidated_file(&name) {
+                continue;
+            }
+            let path = Path::new(&name);
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if extension != "md" {
+                continue;
+            }
+            if let Some((_, rest)) = split_round_prefix(stem)
+                && is_review_file_structure(rest)
+            {
+                files.push(name);
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
+/// List all consolidated reports in the state directory across all branches.
+pub fn list_consolidated_files(bod_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(bod_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".md") && is_consolidated_file(&name) {
+                files.push(name);
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
+/// List all diff/context artifacts created for review rounds across all branches.
+pub fn list_review_context_artifact_files(bod_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(bod_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = Path::new(&name);
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            let Some((_, rest)) = split_round_prefix(stem) else {
+                continue;
+            };
+            if extension != "md" && is_cleanup_candidate(rest, extension) {
+                files.push(name);
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
 /// List review files for the current branch only.
 /// Uses configured codenames so branch suffixes are parsed without ambiguity.
 pub fn list_review_files_for_branch(
@@ -561,22 +637,13 @@ pub fn list_consolidated_files_for_branch(bod_dir: &Path, sanitized_branch: &str
         return Vec::new();
     }
 
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(bod_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let stem = name.strip_suffix(".md").unwrap_or(&name);
-            if name.ends_with(".md")
-                && is_consolidated_file(&name)
-                && consolidated_stem_matches_branch(stem, sanitized_branch)
-            {
-                files.push(name);
-            }
-        }
-    }
-
-    files.sort();
-    files
+    list_consolidated_files(bod_dir)
+        .into_iter()
+        .filter(|name| {
+            let stem = name.strip_suffix(".md").unwrap_or(name);
+            consolidated_stem_matches_branch(stem, sanitized_branch)
+        })
+        .collect()
 }
 
 /// Sort codenames longest-first for prefix-ambiguity resolution.
@@ -1123,6 +1190,24 @@ mod tests {
     }
 
     #[test]
+    fn list_consolidated_files_includes_legacy_and_timestamped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
+        fs::write(dir.path().join("consolidated-main.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-main.log.md"), "").unwrap();
+
+        let files = list_consolidated_files(dir.path());
+
+        assert_eq!(
+            files,
+            vec![
+                "20260316153045-consolidated-feature.md".to_string(),
+                "consolidated-main.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn latest_review_files_picks_highest_round_for_branch() {
         let files = vec![
             "20260316153045-codex-feature.md".to_string(),
@@ -1409,6 +1494,26 @@ mod tests {
     }
 
     #[test]
+    fn list_review_context_artifact_files_returns_known_artifacts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-diff-feature.patch"), "").unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-diffstat-feature.txt"), "").unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-files-feature.txt"), "").unwrap();
+        fs::write(dir.path().join("keep-me.txt"), "").unwrap();
+
+        let files = list_review_context_artifact_files(dir.path());
+
+        assert_eq!(
+            files,
+            vec![
+                "20260316153045n000000000001-diff-feature.patch".to_string(),
+                "20260316153045n000000000001-diffstat-feature.txt".to_string(),
+                "20260316153045n000000000001-files-feature.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn cleanup_old_rounds_preserves_user_timestamped_txt_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
@@ -1432,6 +1537,18 @@ mod tests {
         fs::write(dir.path().join("consolidated-feature-2.md"), "").unwrap();
 
         let files = list_review_files(dir.path());
+        assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
+    }
+
+    #[test]
+    fn list_timestamped_review_files_skips_unrelated_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("keep-me.md"), "").unwrap();
+        fs::write(dir.path().join("notes.md"), "").unwrap();
+
+        let files = list_timestamped_review_files(dir.path());
+
         assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
     }
 

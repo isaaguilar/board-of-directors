@@ -72,6 +72,9 @@ Most people should start with `bugfix`, but these are available when you want mo
 - `bod review` runs only the reviewers for the current branch
 - `bod review consolidate` consolidates the latest review round for the current branch
 - `bod consolidate` lets you choose review files manually and consolidate them
+- `bod clear reviews` removes stored review files, consolidated reports, and diff artifacts for this repo
+- `bod clear` does the same plus clears bugfix history while keeping saved bugfix notes
+- `bod clear all` removes stored review artifacts and deletes bugfix logs entirely
 - `bod version` prints the installed version
 
 ## Config

@@ -4,6 +4,7 @@ mod bugfix;
 mod bugfix_log;
 mod bugfix_session;
 mod claude_cli;
+mod clear;
 mod config;
 mod consolidate;
 mod copilot_cli;
@@ -34,6 +35,11 @@ enum Commands {
     Review {
         #[command(subcommand)]
         command: Option<ReviewCommands>,
+    },
+    /// Clear stored review artifacts and bugfix logs for this repo
+    Clear {
+        #[command(subcommand)]
+        command: Option<ClearCommands>,
     },
     /// Consolidate review findings into a unified report
     Consolidate,
@@ -80,6 +86,14 @@ enum ReviewCommands {
     Consolidate,
 }
 
+#[derive(Subcommand)]
+enum ClearCommands {
+    /// Remove stored review files, consolidated reports, and diff artifacts
+    Reviews,
+    /// Remove stored review artifacts and delete bugfix logs entirely
+    All,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -122,6 +136,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    if let Commands::Clear { command } = &cli.command {
+        let mode = match command {
+            Some(ClearCommands::Reviews) => clear::ClearMode::Reviews,
+            Some(ClearCommands::All) => clear::ClearMode::All,
+            None => clear::ClearMode::Default,
+        };
+        if let Err(e) = clear::run(&repo_root, mode) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let mut config = match config::load(&repo_root) {
         Ok(config) => config,
@@ -187,7 +214,7 @@ async fn main() {
             }
             Err(e) => Err(e),
         },
-        Commands::Init { .. } | Commands::Version => unreachable!(),
+        Commands::Clear { .. } | Commands::Init { .. } | Commands::Version => unreachable!(),
     };
 
     if let Err(e) = result {
@@ -213,6 +240,7 @@ fn active_backends_for_command(
         | Commands::Consolidate => {
             push_backend(&mut backends, config.consolidate.backend);
         }
+        Commands::Clear { .. } => {}
         Commands::Bugfix { .. } => {
             backends = config.used_backends();
         }
@@ -247,6 +275,37 @@ mod tests {
             cli.command,
             Commands::Review {
                 command: Some(ReviewCommands::Consolidate)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_plain_clear_command() {
+        let cli = Cli::try_parse_from(["bod", "clear"]).unwrap();
+
+        assert!(matches!(cli.command, Commands::Clear { command: None }));
+    }
+
+    #[test]
+    fn parses_clear_reviews_subcommand() {
+        let cli = Cli::try_parse_from(["bod", "clear", "reviews"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Clear {
+                command: Some(ClearCommands::Reviews)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_clear_all_subcommand() {
+        let cli = Cli::try_parse_from(["bod", "clear", "all"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Clear {
+                command: Some(ClearCommands::All)
             }
         ));
     }
@@ -356,5 +415,13 @@ mod tests {
             active_backends_for_command(&command, &config),
             vec![config::Backend::GeminiCli]
         );
+    }
+
+    #[test]
+    fn active_backends_for_clear_is_empty() {
+        let command = Commands::Clear { command: None };
+        let config = config::Config::default();
+
+        assert!(active_backends_for_command(&command, &config).is_empty());
     }
 }

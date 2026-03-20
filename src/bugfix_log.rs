@@ -132,6 +132,61 @@ pub fn write_history_preserving_notes(
     result
 }
 
+pub fn clear_history_preserving_notes_file(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let lock_path = path.with_extension("md.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open lock file {}: {}", lock_path.display(), e))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("Failed to acquire lock on {}: {}", lock_path.display(), e))?;
+
+    enum ClearOutcome {
+        Unchanged,
+        Rewritten,
+        Removed,
+    }
+
+    let result = (|| -> Result<ClearOutcome, String> {
+        let existing = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read bugfix log {}: {}", path.display(), e))?;
+        let parts = split_log(&existing);
+        if parts.notes.trim().is_empty() {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("Failed to remove bugfix log {}: {}", path.display(), e))?;
+            return Ok(ClearOutcome::Removed);
+        }
+
+        let updated = render_notes_section(&parts.notes);
+        if updated == existing {
+            return Ok(ClearOutcome::Unchanged);
+        }
+
+        std::fs::write(path, updated)
+            .map_err(|e| format!("Failed to write bugfix log {}: {}", path.display(), e))?;
+        Ok(ClearOutcome::Rewritten)
+    })();
+
+    let _ = lock_file.unlock();
+    let removed_log = matches!(result, Ok(ClearOutcome::Removed));
+    drop(lock_file);
+    if removed_log {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
+    match result? {
+        ClearOutcome::Unchanged => Ok(false),
+        ClearOutcome::Rewritten | ClearOutcome::Removed => Ok(true),
+    }
+}
+
 fn split_log(content: &str) -> BugfixLogParts {
     if let Some((start, end)) = note_bounds(content) {
         let notes_start = start + USER_NOTES_START.len();
@@ -298,5 +353,30 @@ mod tests {
         let parts = read_log_parts_with_migration(dir.path(), "main").unwrap();
         assert_eq!(parts.notes, "new note");
         assert_eq!(parts.history, "## Iteration 1\nkept history\n");
+    }
+
+    #[test]
+    fn clear_history_preserving_notes_file_keeps_notes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write_user_notes(dir.path(), "main", "keep this").unwrap();
+        write_history_preserving_notes(dir.path(), "main", "## Iteration 1\nhistory\n").unwrap();
+
+        let path = files::bugfix_log_path(dir.path(), "main").unwrap();
+        assert!(clear_history_preserving_notes_file(&path).unwrap());
+
+        let parts = read_log_parts_with_migration(dir.path(), "main").unwrap();
+        assert_eq!(parts.notes, "keep this");
+        assert_eq!(parts.history, "");
+    }
+
+    #[test]
+    fn clear_history_preserving_notes_file_removes_logs_without_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = files::bugfix_log_path(dir.path(), "main").unwrap();
+        std::fs::write(&path, "## Iteration 1\nhistory only\n").unwrap();
+
+        assert!(clear_history_preserving_notes_file(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!path.with_extension("md.lock").exists());
     }
 }
