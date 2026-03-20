@@ -60,6 +60,14 @@ impl fmt::Display for ReviewError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewAgentRequest {
+    prompt: String,
+    working_dir: PathBuf,
+    allow_repo_access: bool,
+    use_sandbox: bool,
+}
+
 pub async fn run(config: &Config) -> Result<String, ReviewError> {
     let repo_root = git::repo_root().map_err(ReviewError::fatal)?;
     let state_dir = files::ensure_state_dir(&repo_root).map_err(ReviewError::fatal)?;
@@ -421,57 +429,30 @@ async fn run_agent_review(
     output_path: &PathBuf,
     mut guard: agents::ReservedFile,
 ) -> Result<(), ReviewError> {
-    let output_path_str = output_path.to_string_lossy().to_string();
-    let repo_root_str = repo_root.to_string_lossy().to_string();
-
-    let prompt = format!(
-        r#"You are a senior code reviewer. Review the following git diff for a pull request.
-
-Your task:
-- Identify critical bugs, logic errors, security vulnerabilities, and correctness issues.
-- Be very critical but constructive -- provide actionable feedback.
-- Prioritize correctness over complexity.
-- Keep your review concise enough for a human to read quickly. Do not be overly verbose.
-- Format your review as markdown.
-- Do NOT run `git commit` or `git push`.
-- You may inspect repository files and use read-only git commands for research when helpful. Because your current working directory is tooling state outside the repository, run git commands as `git -C {repo_root_str} <args>` so they target the repository explicitly.
-- Do NOT edit repository files, create files in the repository, or use write tools against repository paths.
-- Your current working directory is board-of-directors tooling state outside the repository.
-- Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
-- Do NOT reference other reviewers or reviews.
-- The only allowed interaction with tooling state is writing the review file requested below.
-
-Write your complete review to the file: {output_path_str}
-
-Here is the diff to review:
-
-```diff
-{diff}
-```"#
-    );
+    let request = build_review_agent_request(repo_root, state_dir, output_path, diff);
 
     let output = backend::run_agent(
         backend,
-        &prompt,
+        &request.prompt,
         model_id,
-        state_dir,
-        false,
-        false,
+        &request.working_dir,
+        request.allow_repo_access,
+        request.use_sandbox,
         repo_root,
         state_dir,
     )
-        .await
-        .map_err(|e| {
-            if backend::is_arg_too_long(&e) {
-                ReviewError::fatal(
-                    "Prompt exceeds OS argument-size limit (E2BIG). \
-                     The diff may be too large for command-line passing. \
-                     Consider reviewing a smaller changeset.",
-                )
-            } else {
-                ReviewError::retryable(format!("{} failed to start agent: {}", codename, e))
-            }
-        })?;
+    .await
+    .map_err(|e| {
+        if backend::is_arg_too_long(&e) {
+            ReviewError::fatal(
+                "Prompt exceeds OS argument-size limit (E2BIG). \
+                 The diff may be too large for command-line passing. \
+                 Consider reviewing a smaller changeset.",
+            )
+        } else {
+            ReviewError::retryable(format!("{} failed to start agent: {}", codename, e))
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -527,6 +508,49 @@ Here is the diff to review:
     Ok(())
 }
 
+fn build_review_agent_request(
+    repo_root: &Path,
+    state_dir: &Path,
+    output_path: &Path,
+    diff: &str,
+) -> ReviewAgentRequest {
+    let output_path_str = output_path.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy().to_string();
+
+    let prompt = format!(
+        r#"You are a senior code reviewer. Review the following git diff for a pull request.
+
+Your task:
+- Identify critical bugs, logic errors, security vulnerabilities, and correctness issues.
+- Be very critical but constructive -- provide actionable feedback.
+- Prioritize correctness over complexity.
+- Keep your review concise enough for a human to read quickly. Do not be overly verbose.
+- Format your review as markdown.
+- Do NOT run `git commit` or `git push`.
+- You may inspect repository files and use read-only git commands for research when helpful. Because your current working directory is tooling state outside the repository, run git commands as `git -C {repo_root_str} <args>` so they target the repository explicitly.
+- Do NOT edit repository files, create files in the repository, or use write tools against repository paths.
+- Your current working directory is board-of-directors tooling state outside the repository.
+- Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
+- Do NOT reference other reviewers or reviews.
+- The only allowed interaction with tooling state is writing the review file requested below.
+
+Write your complete review to the file: {output_path_str}
+
+Here is the diff to review:
+
+```diff
+{diff}
+```"#
+    );
+
+    ReviewAgentRequest {
+        prompt,
+        working_dir: state_dir.to_path_buf(),
+        allow_repo_access: true,
+        use_sandbox: false,
+    }
+}
+
 fn reviewer_start_delays(count: usize) -> Vec<Duration> {
     let mut delays = Vec::with_capacity(count);
     let mut cumulative_secs = 0u64;
@@ -576,5 +600,23 @@ mod tests {
         assert_eq!(delays[0], Duration::from_secs(0));
         assert!((2..=5).contains(&delays[1].as_secs()));
         assert!((4..=10).contains(&delays[2].as_secs()));
+    }
+
+    #[test]
+    fn review_agent_request_uses_state_dir_with_repo_read_access() {
+        let request = build_review_agent_request(
+            Path::new("/repo"),
+            Path::new("/state"),
+            Path::new("/state/review.md"),
+            "diff body",
+        );
+
+        assert_eq!(request.working_dir, PathBuf::from("/state"));
+        assert!(request.allow_repo_access);
+        assert!(!request.use_sandbox);
+        assert!(request.prompt.contains("git -C /repo"));
+        assert!(request
+            .prompt
+            .contains("Do NOT edit repository files, create files in the repository"));
     }
 }

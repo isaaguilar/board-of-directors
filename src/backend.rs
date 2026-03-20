@@ -16,35 +16,9 @@ pub const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const NODE_HEAP_LIMIT_MB: &str = "8192";
 
 /// Git subcommands denied by the Copilot backend (`--deny-tool=shell(git <subcmd>)`).
-/// The Claude backend uses a blanket `Bash(git:*)` pattern instead (see claude_cli.rs).
-pub const DENIED_GIT_SUBCOMMANDS: &[&str] = &[
-    "commit",
-    "push",
-    "pull",
-    "fetch",
-    "remote",
-    "rebase",
-    "reset",
-    "clean",
-    "merge",
-    "checkout",
-    "switch",
-    "restore",
-    "apply",
-    "cherry-pick",
-    "revert",
-    "rm",
-    "branch",
-    "tag",
-    "stash",
-    "config",
-    "add",
-    "update-index",
-    "mv",
-    "worktree",
-    "init",
-    "submodule",
-];
+/// Board of Directors intentionally allows normal git research and shell usage.
+/// The only built-in git restrictions are `git commit` and `git push`.
+pub const DENIED_GIT_SUBCOMMANDS: &[&str] = &["commit", "push"];
 
 /// Default agent timeout: 30 minutes.
 ///

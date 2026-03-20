@@ -191,19 +191,7 @@ fn prompt_backend(role_label: &str) -> Result<Backend, String> {
 }
 
 fn print_backend_warning(backend: Backend) {
-    match backend {
-        Backend::ClaudeCode => {
-            println!();
-            claude_cli::print_permissions_warning();
-            println!();
-        }
-        Backend::GeminiCli => {
-            println!();
-            gemini_cli::print_permissions_warning();
-            println!();
-        }
-        Backend::Copilot => {}
-    }
+    let _ = backend;
 }
 
 fn discover_models_for_backend_cached(

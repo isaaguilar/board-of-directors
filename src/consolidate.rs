@@ -5,7 +5,15 @@ use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsolidationAgentRequest {
+    prompt: String,
+    working_dir: PathBuf,
+    allow_repo_access: bool,
+    use_sandbox: bool,
+}
 
 /// Interactive consolidation -- user picks which review files to consolidate.
 pub async fn run(config: &Config) -> Result<(), String> {
@@ -314,6 +322,56 @@ async fn run_consolidation(
         ));
     }
 
+    let request = build_consolidation_agent_request(
+        repo_root,
+        bod_dir,
+        out_path,
+        severity_tags,
+        bugfix_log,
+        user_notes,
+        &reviews_content,
+    );
+
+    let output = backend::run_agent(
+        backend,
+        &request.prompt,
+        model,
+        &request.working_dir,
+        request.allow_repo_access,
+        request.use_sandbox,
+        repo_root,
+        bod_dir,
+    )
+        .await
+        .map_err(|e| {
+            if backend::is_arg_too_long(&e) {
+                "Prompt exceeds OS argument-size limit (E2BIG). \
+                 The diff may be too large for command-line passing. \
+                 Consider reviewing a smaller changeset."
+                    .to_string()
+            } else {
+                format!("Failed to start agent for consolidation: {}", e)
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Consolidation agent failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout)
+}
+
+fn build_consolidation_agent_request(
+    repo_root: &Path,
+    bod_dir: &Path,
+    out_path: &Path,
+    severity_tags: bool,
+    bugfix_log: &str,
+    user_notes: &str,
+    reviews_content: &str,
+) -> ConsolidationAgentRequest {
     let out_path_str = out_path.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy().to_string();
 
@@ -412,24 +470,36 @@ Here are the individual reviews:
 {reviews_content}"#
     );
 
-    let output = backend::run_agent(backend, &prompt, model, bod_dir, false, false, repo_root, bod_dir)
-        .await
-        .map_err(|e| {
-            if backend::is_arg_too_long(&e) {
-                "Prompt exceeds OS argument-size limit (E2BIG). \
-                 The diff may be too large for command-line passing. \
-                 Consider reviewing a smaller changeset."
-                    .to_string()
-            } else {
-                format!("Failed to start agent for consolidation: {}", e)
-            }
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Consolidation agent failed: {}", stderr));
+    ConsolidationAgentRequest {
+        prompt,
+        working_dir: bod_dir.to_path_buf(),
+        allow_repo_access: true,
+        use_sandbox: false,
     }
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(stdout)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consolidation_agent_request_uses_state_dir_with_repo_read_access() {
+        let request = build_consolidation_agent_request(
+            Path::new("/repo"),
+            Path::new("/state"),
+            Path::new("/state/consolidated.md"),
+            true,
+            "",
+            "",
+            "--- Review from a ---\n[HIGH] issue",
+        );
+
+        assert_eq!(request.working_dir, PathBuf::from("/state"));
+        assert!(request.allow_repo_access);
+        assert!(!request.use_sandbox);
+        assert!(request.prompt.contains("git -C /repo"));
+        assert!(request
+            .prompt
+            .contains("Only write the requested consolidated report file."));
+    }
 }

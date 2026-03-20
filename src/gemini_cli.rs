@@ -3,12 +3,8 @@ use tokio::process::Command;
 
 /// Build a Gemini CLI command.
 ///
-/// The prompt is delivered via the `--prompt` argument. Note that large prompts
-/// might exceed OS argument-size limits and will be visible in `ps` output.
-///
-/// Gemini CLI does not expose the same git-specific deny-list flags that the
-/// Copilot and Claude CLIs do, so this integration leans on Gemini's sandbox
-/// mode plus prompt-level restrictions. Treat agent output as untrusted.
+/// The prompt is delivered via the `--prompt` argument. Large prompts may still
+/// hit OS argument-size limits and will be visible in `ps` output.
 pub async fn command(
     model: &str,
     working_dir: &Path,
@@ -43,19 +39,10 @@ pub async fn command(
     Ok(command)
 }
 
-pub fn print_permissions_warning() {
-    eprintln!("Warning: Gemini CLI backend runs with --approval-mode yolo.");
-    eprintln!("  Tool actions are auto-approved for non-interactive execution.");
-    eprintln!("  Gemini's --sandbox provides extra containment but PATH-based sanitization cannot prevent");
-    eprintln!("  an agent from executing absolute-path binaries (e.g., /usr/bin/git) in child processes.");
-    eprintln!("  For stronger isolation run agents inside OS-level sandboxes (containers, seccomp, namespaces) and review agent output carefully.");
-}
-
 pub const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--model",
     "--prompt",
     "--approval-mode",
-    "--sandbox",
     "--include-directories",
     "--output-format",
 ];
@@ -67,7 +54,7 @@ pub fn check_required_flags(help_stdout: &str, help_stderr: &str) -> Result<(), 
         let re = Regex::new(&pattern).unwrap();
         if !re.is_match(help_stdout) && !re.is_match(help_stderr) {
             return Err(format!(
-                "Your Gemini CLI does not support {}. This flag is required for safe non-interactive operation. Please upgrade your Gemini CLI or use another backend.",
+                "Your Gemini CLI does not support {}. This flag is required for non-interactive operation. Please upgrade your Gemini CLI or use another backend.",
                 flag
             ));
         }
@@ -92,14 +79,13 @@ mod tests {
 
     #[test]
     fn detects_missing_required_flags() {
-        let error = check_required_flags("--model --sandbox", "").unwrap_err();
+        let error = check_required_flags("--model", "").unwrap_err();
         assert!(error.contains("--prompt"));
     }
 
     #[test]
     fn accepts_help_output_with_required_flags() {
-        let help =
-            "--model --prompt --approval-mode --sandbox --include-directories --output-format";
+        let help = "--model --prompt --approval-mode --include-directories --output-format";
         assert!(check_required_flags(help, "").is_ok());
     }
 }

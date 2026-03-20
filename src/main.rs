@@ -54,6 +54,12 @@ enum Commands {
         /// Wait for a manual start after opening the dashboard
         #[arg(long)]
         delay_start: bool,
+        /// Start the dashboard without opening a browser automatically
+        #[arg(long)]
+        no_open: bool,
+        /// Print the planned bugfix execution without launching agents or the dashboard
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print version information
     Version,
@@ -133,18 +139,16 @@ async fn main() {
     for backend in active_backends_for_command(&cli.command, &config) {
         match backend {
             config::Backend::ClaudeCode => {
-                if let Err(e) = claude_cli::verify_disallowed_tools_support().await {
+                if let Err(e) = claude_cli::verify_required_flags().await {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
-                claude_cli::print_permissions_warning();
             }
             config::Backend::GeminiCli => {
                 if let Err(e) = gemini_cli::verify_required_flags().await {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
-                gemini_cli::print_permissions_warning();
             }
             config::Backend::Copilot => {}
         }
@@ -165,6 +169,8 @@ async fn main() {
             severity,
             prompt,
             delay_start,
+            no_open,
+            dry_run,
         } => match bugfix::SeverityLevel::from_str(&severity) {
             Ok(level) => {
                 bugfix::run(
@@ -174,6 +180,8 @@ async fn main() {
                     &config,
                     prompt.as_deref(),
                     delay_start,
+                    no_open,
+                    dry_run,
                 )
                 .await
             }
@@ -279,6 +287,26 @@ mod tests {
                 iterations: None,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_bugfix_dry_run_flag() {
+        let cli = Cli::try_parse_from(["bod", "bugfix", "--dry-run"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Bugfix { dry_run: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_bugfix_no_open_flag() {
+        let cli = Cli::try_parse_from(["bod", "bugfix", "--no-open"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Bugfix { no_open: true, .. }
         ));
     }
 

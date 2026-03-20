@@ -13,7 +13,7 @@ use regex::Regex;
 use serde::Serialize;
 use std::fmt;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -75,6 +75,16 @@ enum ManualStartOutcome {
     Cancelled,
 }
 
+const REVIEW_FILE_RETENTION: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixAgentRequest {
+    prompt: String,
+    working_dir: PathBuf,
+    allow_repo_access: bool,
+    use_sandbox: bool,
+}
+
 pub async fn run(
     timeout_secs: u64,
     max_iterations: Option<u32>,
@@ -82,6 +92,8 @@ pub async fn run(
     config: &Config,
     cli_prompt: Option<&str>,
     delay_start: bool,
+    no_open: bool,
+    dry_run: bool,
 ) -> Result<(), String> {
     let repo_root = git::repo_root()?;
     let state_dir = files::ensure_state_dir(&repo_root)?;
@@ -99,6 +111,28 @@ pub async fn run(
 
     let log_path = files::bugfix_log_path(&state_dir, &sanitized_branch)
         .map_err(|e| format!("Invalid branch for bugfix log path: {}", e))?;
+
+    if dry_run {
+        println!(
+            "{}",
+            render_dry_run_summary(
+                config,
+                &repo_root,
+                &state_dir,
+                &branch,
+                &sanitized_branch,
+                &log_path,
+                timeout_secs,
+                max_iterations,
+                severity,
+                cli_prompt,
+                delay_start,
+                no_open,
+            )
+        );
+        return Ok(());
+    }
+
     bugfix_log::ensure_user_notes_section(&state_dir, &sanitized_branch)?;
 
     if let Some(prompt) = cli_prompt {
@@ -131,9 +165,13 @@ pub async fn run(
         severity.included_levels().join(", ")
     );
     println!("Dashboard: {} (port {})", server.url, server.port);
-    match web::open_browser(&server.url) {
-        Ok(()) => println!("Opened the live dashboard in your browser."),
-        Err(e) => eprintln!("Warning: {} Open {} manually.", e, server.url),
+    if no_open {
+        println!("Automatic browser launch is disabled. Open the URL manually if you want the dashboard.");
+    } else {
+        match web::open_browser(&server.url) {
+            Ok(()) => println!("Opened the live dashboard in your browser."),
+            Err(e) => eprintln!("Warning: {} Open {} manually.", e, server.url),
+        }
     }
 
     let started = if delay_start {
@@ -224,7 +262,7 @@ pub async fn run(
             iteration, remaining, active_severity
         );
 
-        if let Err(e) = agents::cleanup_old_rounds(&state_dir, 10) {
+        if let Err(e) = agents::cleanup_old_rounds(&state_dir, REVIEW_FILE_RETENTION) {
             eprintln!("Warning: failed to clean up old review files: {}", e);
         }
 
@@ -251,9 +289,9 @@ pub async fn run(
                         ts
                     }
                     None => {
-                        eprintln!("  Review step failed completely. Retrying in next iteration.");
-                        session.set_message(format!("Review step failed: {}", e)).await;
-                        continue;
+                        let message = terminal_step_failure("Review step failed", e.to_string());
+                        session.mark_error(message.clone()).await;
+                        return Err(message);
                     }
                 }
             }
@@ -322,11 +360,13 @@ pub async fn run(
                 report
             }
             StepOutcome::Completed(Err(e)) => {
-                eprintln!("  Consolidation failed: {}. Retrying in next iteration.", e);
+                eprintln!("  Consolidation failed: {}", e);
                 session
                     .fail_consolidation(&consolidate_label, e.to_string())
                     .await;
-                continue;
+                let message = terminal_step_failure("Consolidation failed", e);
+                session.mark_error(message.clone()).await;
+                return Err(message);
             }
             StepOutcome::Cancelled => {
                 session
@@ -446,8 +486,9 @@ pub async fn run(
                     return Err(message);
                 }
                 session.fail_fix(&bugfix_label, e.to_string()).await;
-                eprintln!("  Fix step failed: {}. Retrying in next iteration.", e);
-                continue;
+                let message = terminal_step_failure("Fix step failed", e);
+                session.mark_error(message.clone()).await;
+                return Err(message);
             }
             FixAgentOutcome::Cancelled => {
                 if let Err(e) = restore_fix_step_state(
@@ -524,6 +565,87 @@ fn final_result_from_status(
     }
 }
 
+fn terminal_step_failure(prefix: &str, detail: impl Into<String>) -> String {
+    format!("{prefix}: {}", detail.into())
+}
+
+fn render_dry_run_summary(
+    config: &Config,
+    repo_root: &Path,
+    state_dir: &Path,
+    branch: &str,
+    sanitized_branch: &str,
+    log_path: &Path,
+    timeout_secs: u64,
+    max_iterations: Option<u32>,
+    severity: SeverityLevel,
+    cli_prompt: Option<&str>,
+    delay_start: bool,
+    no_open: bool,
+) -> String {
+    let reviewers = config
+        .review
+        .models
+        .iter()
+        .map(|entry| format!("- {}: {} / {}", entry.codename, entry.backend, entry.model))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let iteration_limit = max_iterations
+        .map(|max| max.to_string())
+        .unwrap_or_else(|| "unbounded (stops when clean or timed out)".to_string());
+    let prompt_note = if cli_prompt.is_some() {
+        "A CLI prompt was supplied, but dry-run mode does not append notes to the bugfix log."
+    } else {
+        "No extra CLI prompt was supplied."
+    };
+
+    format!(
+        r#"Bugfix dry run only. No agents, dashboard, browser launch, bugfix-log writes, or repo changes will occur.
+
+Repository root: {}
+State dir: {}
+Branch: {}
+Sanitized branch: {}
+Bugfix log path: {}
+Timeout: {}s
+Iteration limit: {}
+Severity threshold: {}
+Manual start: {}
+Browser auto-open: {}
+Review artifact cleanup limit: {}
+Reviewers:
+{}
+Consolidator: {} / {}
+Fixer: {} / {}
+Fixer execution:
+- working directory: {}
+- repository access: source edits are limited to {}
+- bugfix log appends must go directly to {}
+- repo-local temporary .md/.txt files are forbidden
+{}"#,
+        repo_root.display(),
+        state_dir.display(),
+        branch,
+        sanitized_branch,
+        log_path.display(),
+        timeout_secs,
+        iteration_limit,
+        severity,
+        if delay_start { "enabled" } else { "disabled" },
+        if no_open { "disabled" } else { "enabled" },
+        REVIEW_FILE_RETENTION,
+        reviewers,
+        config.consolidate.backend,
+        config.consolidate.model,
+        config.bugfix.backend,
+        config.bugfix.model,
+        state_dir.display(),
+        repo_root.display(),
+        log_path.display(),
+        prompt_note
+    )
+}
+
 fn count_severities(report: &str, included: &[&str]) -> Vec<(String, u32)> {
     included
         .iter()
@@ -570,6 +692,72 @@ mod tests {
             final_result_from_status(SessionStatus::Completed, None, "done"),
             Ok(())
         );
+    }
+
+    #[test]
+    fn dry_run_summary_skips_agents_and_shows_fixer_context() {
+        let config = Config {
+            review: crate::config::ReviewConfig {
+                models: vec![crate::config::ModelEntry {
+                    codename: "reviewer-one".to_string(),
+                    backend: Backend::Copilot,
+                    model: "gpt-5-mini".to_string(),
+                }],
+            },
+            consolidate: crate::config::ConsolidateConfig {
+                backend: Backend::ClaudeCode,
+                model: "sonnet".to_string(),
+            },
+            bugfix: crate::config::BugfixConfig {
+                backend: Backend::GeminiCli,
+                model: "flash".to_string(),
+            },
+        };
+
+        let summary = render_dry_run_summary(
+            &config,
+            Path::new("/repo"),
+            Path::new("/state"),
+            "feature",
+            "feature",
+            Path::new("/state/bugfix-feature.log.md"),
+            3600,
+            Some(2),
+            SeverityLevel::High,
+            Some("investigate"),
+            true,
+            true,
+        );
+
+        assert!(summary.contains("Bugfix dry run only. No agents"));
+        assert!(summary.contains("Browser auto-open: disabled"));
+        assert!(summary.contains("working directory: /state"));
+        assert!(summary.contains("bugfix log appends must go directly to /state/bugfix-feature.log.md"));
+        assert!(summary.contains("dry-run mode does not append notes to the bugfix log"));
+    }
+
+    #[test]
+    fn fix_agent_request_uses_state_dir_and_forbids_repo_temp_files() {
+        let request = build_fix_agent_request(
+            Path::new("/repo"),
+            Path::new("/state"),
+            "[HIGH] incorrect behavior",
+            "",
+            "",
+            Path::new("/state/bugfix-feature.log.md"),
+            1,
+            "20260320120000n123456789abc",
+            &SeverityLevel::High,
+        );
+
+        assert_eq!(request.working_dir, PathBuf::from("/state"));
+        assert!(request.allow_repo_access);
+        assert!(!request.use_sandbox);
+        assert!(request.prompt.contains("git -C /repo"));
+        assert!(request
+            .prompt
+            .contains("Do NOT create temporary `.md` or `.txt` files in the repository."));
+        assert!(request.prompt.contains("/state/bugfix-feature.log.md"));
     }
 }
 
@@ -638,9 +826,7 @@ fn extract_actionable(report: &str, severity: &SeverityLevel) -> String {
     }
 }
 
-async fn run_fix_agent(
-    session: &BugfixSession,
-    backend: &Backend,
+fn build_fix_agent_request(
     repo_root: &Path,
     state_dir: &Path,
     report: &str,
@@ -650,10 +836,10 @@ async fn run_fix_agent(
     iteration: u32,
     review_timestamp: &str,
     severity: &SeverityLevel,
-    fix_model: &str,
-) -> FixAgentOutcome {
+) -> FixAgentRequest {
     let issues = extract_actionable(report, severity);
     let log_path_str = log_path.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy().to_string();
     let levels_label = severity.included_levels().join(", ");
 
     let history_section = if prior_history.is_empty() {
@@ -696,12 +882,15 @@ Your task:
 - Make precise, surgical changes. Do not refactor unrelated code.
 - Prioritize correctness. Every fix must be correct.
 - After making changes, verify they compile (run the project's build/check command).
-        - Do NOT run `git commit` or `git push`.
-        - Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
-        - Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
-        - Treat files under `~/.config/board-of-directors/` as internal board-of-directors tooling state.
-        - Do NOT inspect or use that tooling state as repository source material.
+- Do NOT run `git commit` or `git push`.
+- Your current working directory is board-of-directors tooling state outside the repository. The repository root is `{repo_root_str}`.
+- Read-only git commands for research are allowed when helpful, but run them as `git -C {repo_root_str} <args>` so they target the repository explicitly.
+- When you run build, check, or test commands, target the repository explicitly (for example `cd {repo_root_str} && cargo build`).
+- Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
+- Treat files under `~/.config/board-of-directors/` as internal board-of-directors tooling state.
+- Do NOT inspect or use that tooling state as repository source material.
 - The only allowed interaction with tooling state is appending the required summary to the fix log below.
+- Do NOT create temporary `.md` or `.txt` files in the repository. Append directly to `{log_path_str}`. If you need scratch space, use the tooling state directory or the system temp directory, not the repo checkout, and clean it up before finishing.
 - Do NOT create new documentation files or write documentation from scratch unless editing an existing doc is directly required to complete a correctness fix.
 - Do NOT create new test files unless a fix specifically requires one.
 
@@ -727,14 +916,48 @@ For each fix, write:
 "#
     );
 
+    FixAgentRequest {
+        prompt,
+        working_dir: state_dir.to_path_buf(),
+        allow_repo_access: true,
+        use_sandbox: false,
+    }
+}
+
+async fn run_fix_agent(
+    session: &BugfixSession,
+    backend: &Backend,
+    repo_root: &Path,
+    state_dir: &Path,
+    report: &str,
+    prior_history: &str,
+    user_notes: &str,
+    log_path: &Path,
+    iteration: u32,
+    review_timestamp: &str,
+    severity: &SeverityLevel,
+    fix_model: &str,
+) -> FixAgentOutcome {
+    let request = build_fix_agent_request(
+        repo_root,
+        state_dir,
+        report,
+        prior_history,
+        user_notes,
+        log_path,
+        iteration,
+        review_timestamp,
+        severity,
+    );
+
     let mut cancel_rx = session.subscribe_cancel();
     let output = match backend::run_agent_cancellable(
         backend,
-        &prompt,
+        &request.prompt,
         fix_model,
-        repo_root,
-        false,
-        true,
+        &request.working_dir,
+        request.allow_repo_access,
+        request.use_sandbox,
         repo_root,
         state_dir,
         &mut cancel_rx,
