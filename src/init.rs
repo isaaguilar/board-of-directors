@@ -285,33 +285,83 @@ fn print_available_models(models: &[String]) {
 fn discover_copilot_models() -> Result<Vec<String>, String> {
     println!("Discovering available models from copilot...\n");
 
-    let output = Command::new("copilot")
+    let config_help = Command::new("copilot")
+        .args(["help", "config"])
+        .output()
+        .map_err(|e| format!("Failed to run 'copilot help config': {}", e))?;
+    let config_help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&config_help.stdout),
+        String::from_utf8_lossy(&config_help.stderr)
+    );
+    let models = parse_copilot_models_from_config_help(&config_help_text);
+    if !models.is_empty() {
+        return Ok(models);
+    }
+
+    let help_output = Command::new("copilot")
         .arg("--help")
         .output()
         .map_err(|e| format!("Failed to run 'copilot --help': {}", e))?;
-
-    let help_text = String::from_utf8_lossy(&output.stdout).to_string();
-    let models = parse_model_choices(&help_text);
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help_output.stdout),
+        String::from_utf8_lossy(&help_output.stderr)
+    );
+    let models = parse_copilot_models_from_flag_help(&help_text);
 
     if models.is_empty() {
-        eprintln!("Warning: could not parse models from copilot --help. Using fallback list.");
+        eprintln!(
+            "Warning: could not parse models from Copilot CLI help output. Using fallback list."
+        );
         return Ok(fallback_copilot_models());
     }
 
     Ok(models)
 }
 
-fn parse_model_choices(help_text: &str) -> Vec<String> {
-    let full = help_text.replace('\n', " ");
-    let re = Regex::new(r#"--model\s+<[^>]+>\s+.*?\(choices:\s*(.*?)\)"#).unwrap();
-    if let Some(caps) = re.captures(&full) {
-        let choices_str = &caps[1];
-        let model_re = Regex::new(r#"\"([^\"]+)\""#).unwrap();
-        return model_re
-            .captures_iter(choices_str)
-            .map(|c| c[1].to_string())
-            .collect();
+fn parse_copilot_models_from_config_help(help_text: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut in_model_section = false;
+    let quoted_model = Regex::new(r#""([^"]+)""#).unwrap();
+
+    for line in help_text.lines() {
+        let trimmed = line.trim_start();
+        if !in_model_section {
+            if trimmed.starts_with("`model`:") {
+                in_model_section = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('`') && trimmed.contains("`:") {
+            break;
+        }
+
+        if let Some(caps) = quoted_model.captures(trimmed) {
+            models.push(caps[1].to_string());
+        }
     }
+
+    models
+}
+
+fn parse_copilot_models_from_flag_help(help_text: &str) -> Vec<String> {
+    for line in help_text.lines() {
+        if !line.contains("--model") || !line.contains("choices:") {
+            continue;
+        }
+
+        let quoted_model = Regex::new(r#""([^"]+)""#).unwrap();
+        let models: Vec<String> = quoted_model
+            .captures_iter(line)
+            .map(|caps| caps[1].to_string())
+            .collect();
+        if !models.is_empty() {
+            return models;
+        }
+    }
+
     Vec::new()
 }
 
@@ -479,12 +529,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_model_choices_extracts_copilot_help_choices() {
-        let help = r#"Usage: copilot --model <model> foo (choices: "gpt-5", "claude-opus-4.6")"#;
+    fn parse_copilot_models_from_config_help_extracts_model_list() {
+        let help = r#"  `model`: AI model to use for Copilot CLI; can be changed with /model command or --model flag option.
+    - "claude-sonnet-4.6"
+    - "gemini-3-pro-preview"
+
+  `mouse`: whether to enable mouse support in alt screen mode; defaults to `true`.
+"#;
         assert_eq!(
-            parse_model_choices(help),
-            vec!["gpt-5".to_string(), "claude-opus-4.6".to_string()]
+            parse_copilot_models_from_config_help(help),
+            vec![
+                "claude-sonnet-4.6".to_string(),
+                "gemini-3-pro-preview".to_string()
+            ]
         );
+    }
+
+    #[test]
+    fn parse_copilot_models_from_flag_help_ignores_other_choice_blocks() {
+        let help = r#"  --model <model>                     Set the AI model to use
+  --output-format <format>            Output format: 'text' (default) or 'json'
+                                      (choices: "text", "json")
+"#;
+        assert!(parse_copilot_models_from_flag_help(help).is_empty());
     }
 
     #[test]
