@@ -2,7 +2,9 @@ use crate::claude_cli;
 use crate::config::{
     self, Backend, BugfixConfig, Config, ConsolidateConfig, ModelEntry, ReviewConfig,
 };
+use crate::gemini_cli;
 use regex::Regex;
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::Command;
@@ -12,35 +14,30 @@ use std::process::Command;
 /// - `reconfigure`: skip the "overwrite?" prompt
 /// - `repo_root`: required when `global` is false (repo-scoped config, stored outside the repo)
 pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<(), String> {
-    let (config_exists, config_path_display, load_existing): (
-        bool,
-        String,
-        Box<dyn Fn() -> Config>,
-    ) = if global {
-        (
-            config::global_config_exists(),
-            config::global_config_path().display().to_string(),
-            Box::new(config::load_global),
-        )
+    let config_path = if global {
+        config::global_config_path()
     } else {
         let root =
             repo_root.ok_or("Not inside a git repository. Use --global for global config.")?;
-        (
-            config::local_config_exists(root),
-            config::local_config_path(root).display().to_string(),
-            {
-                let root = root.to_path_buf();
-                Box::new(move || try_load_local(&root).unwrap_or_default())
-            },
-        )
+        config::local_config_path(root)
     };
+    let config_exists = config_path.exists();
 
     if config_exists && !reconfigure {
-        let current = load_existing();
         println!("A configuration already exists at:");
-        println!("  {}\n", config_path_display);
-        print_config(&current);
-        println!();
+        println!("  {}\n", config_path.display());
+        match config::load_path(&config_path) {
+            Ok(Some(current)) => {
+                print_config(&current);
+                println!();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Warning: {}", e);
+                eprintln!("The existing file must be replaced with a new per-role config.");
+                println!();
+            }
+        }
 
         if !prompt_yes_no("Do you want to overwrite the current settings?")? {
             println!("Keeping existing configuration.");
@@ -49,71 +46,39 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
         println!();
     }
 
-    // Pick backend first (determines available models)
-    println!("-- Backend --");
-    let backend = prompt_backend()?;
-    if backend == Backend::ClaudeCode {
-        println!();
-        claude_cli::print_permissions_warning();
-    }
-    println!();
+    let mut discovered_models = BTreeMap::new();
 
-    let models = discover_models_for_backend(&backend)?;
-    println!("Available models:\n");
-    for (i, model) in models.iter().enumerate() {
-        println!("  [{}] {}", i + 1, model);
-    }
-    println!();
-
-    // Pick 3 review models
-    println!("-- Review Models --");
-    println!("Pick 3 models to run as independent code reviewers.\n");
+    println!("-- Reviewers --");
+    println!("Configure 3 independent reviewers. Each one can use a different backend.\n");
     let mut review_models: Vec<ModelEntry> = Vec::new();
     let mut used_codenames: Vec<String> = Vec::new();
     for i in 1..=3 {
-        let idx = prompt_model_choice(&format!("Review model #{}", i), &models)?;
-        let model = &models[idx];
-        let default_cn = derive_codename(model, &used_codenames);
-        let codename =
-            prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
-        // Sanitize codename: only allow filesystem-safe characters [a-zA-Z0-9_-].
-        let codename = sanitize_codename(&codename)?;
-        if codename == "consolidated" || codename.starts_with("consolidated-") {
-            return Err(format!(
-                "Codename '{}' is reserved (conflicts with consolidated report filenames). \
-                 Choose a different codename.",
-                codename
-            ));
-        }
-        used_codenames.push(codename.clone());
-        review_models.push(ModelEntry {
-            codename,
-            model: model.clone(),
-        });
+        println!("Reviewer #{}", i);
+        let reviewer = prompt_review_model(i, &used_codenames, &mut discovered_models)?;
+        used_codenames.push(reviewer.codename.clone());
+        review_models.push(reviewer);
         println!();
     }
 
-    // Pick consolidation model
-    println!("-- Consolidation Model --");
-    let idx = prompt_model_choice("Model for consolidating reviews", &models)?;
-    let consolidate_model = models[idx].clone();
+    println!("-- Consolidator --");
+    let (consolidate_backend, consolidate_model) =
+        prompt_backend_and_model("consolidator", &mut discovered_models)?;
     println!();
 
-    // Pick bugfix model
-    println!("-- Bugfix Model --");
-    let idx = prompt_model_choice("Model for applying fixes", &models)?;
-    let bugfix_model = models[idx].clone();
+    println!("-- Fixer --");
+    let (bugfix_backend, bugfix_model) = prompt_backend_and_model("fixer", &mut discovered_models)?;
     println!();
 
     let new_config = Config {
-        backend,
         review: ReviewConfig {
             models: review_models,
         },
         consolidate: ConsolidateConfig {
+            backend: consolidate_backend,
             model: consolidate_model,
         },
         bugfix: BugfixConfig {
+            backend: bugfix_backend,
             model: bugfix_model,
         },
     };
@@ -134,41 +99,64 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
     Ok(())
 }
 
-fn try_load_local(repo_root: &Path) -> Option<Config> {
-    let path = config::local_config_path(repo_root);
-    if !path.exists() {
-        return None;
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            if let Ok(config) = toml::from_str::<Config>(&content) {
-                return Some(config);
-            }
-        }
-        Err(_) => return None,
-    }
-
-    None
-}
-
 fn print_config(config: &Config) {
-    println!("  Backend:     {}", config.backend);
     println!("  Review models:");
     for m in &config.review.models {
-        println!("    {} -> {}", m.codename, m.model);
+        println!("    {} -> {} / {}", m.codename, m.backend, m.model);
     }
-    println!("  Consolidation: {}", config.consolidate.model);
-    println!("  Bugfix:        {}", config.bugfix.model);
+    println!(
+        "  Consolidation: {} / {}",
+        config.consolidate.backend, config.consolidate.model
+    );
+    println!(
+        "  Bugfix:        {} / {}",
+        config.bugfix.backend, config.bugfix.model
+    );
 }
 
-fn prompt_backend() -> Result<Backend, String> {
-    println!("Which CLI backend should bod use?\n");
+fn prompt_review_model(
+    index: usize,
+    used_codenames: &[String],
+    discovered_models: &mut BTreeMap<Backend, Vec<String>>,
+) -> Result<ModelEntry, String> {
+    let (backend, model) =
+        prompt_backend_and_model(&format!("reviewer #{}", index), discovered_models)?;
+    let default_cn = derive_codename(&model, used_codenames);
+    let codename = prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
+    let codename = sanitize_codename(&codename)?;
+    if codename == "consolidated" || codename.starts_with("consolidated-") {
+        return Err(format!(
+            "Codename '{}' is reserved (conflicts with consolidated report filenames). Choose a different codename.",
+            codename
+        ));
+    }
+    Ok(ModelEntry {
+        codename,
+        backend,
+        model,
+    })
+}
+
+fn prompt_backend_and_model(
+    role_label: &str,
+    discovered_models: &mut BTreeMap<Backend, Vec<String>>,
+) -> Result<(Backend, String), String> {
+    let backend = prompt_backend(role_label)?;
+    print_backend_warning(backend);
+    let models = discover_models_for_backend_cached(backend, discovered_models)?;
+    print_available_models(&models);
+    let model = prompt_model_choice(&format!("Model for {}", role_label), &models)?;
+    Ok((backend, model))
+}
+
+fn prompt_backend(role_label: &str) -> Result<Backend, String> {
+    println!("Which CLI backend should {} use?\n", role_label);
     println!("  [1] Copilot CLI  (copilot)");
-    println!("  [2] Claude Code  (claude)\n");
+    println!("  [2] Claude Code  (claude)");
+    println!("  [3] Gemini CLI   (gemini)\n");
 
     loop {
-        print!("Backend (1-2): ");
+        print!("Backend (1-3): ");
         io::stdout()
             .flush()
             .map_err(|e| format!("IO error: {}", e))?;
@@ -191,11 +179,44 @@ fn prompt_backend() -> Result<Backend, String> {
                 println!("  -> Claude Code");
                 return Ok(Backend::ClaudeCode);
             }
+            "3" => {
+                println!("  -> Gemini CLI");
+                return Ok(Backend::GeminiCli);
+            }
             other => {
-                eprintln!("  Invalid choice '{}'. Enter 1 or 2.", other);
+                eprintln!("  Invalid choice '{}'. Enter 1, 2, or 3.", other);
             }
         }
     }
+}
+
+fn print_backend_warning(backend: Backend) {
+    match backend {
+        Backend::ClaudeCode => {
+            println!();
+            claude_cli::print_permissions_warning();
+            println!();
+        }
+        Backend::GeminiCli => {
+            println!();
+            gemini_cli::print_permissions_warning();
+            println!();
+        }
+        Backend::Copilot => {}
+    }
+}
+
+fn discover_models_for_backend_cached(
+    backend: Backend,
+    discovered_models: &mut BTreeMap<Backend, Vec<String>>,
+) -> Result<Vec<String>, String> {
+    if let Some(models) = discovered_models.get(&backend) {
+        return Ok(models.clone());
+    }
+
+    let models = discover_models_for_backend(&backend)?;
+    discovered_models.insert(backend, models.clone());
+    Ok(models)
 }
 
 /// Discover models appropriate for the selected backend.
@@ -203,27 +224,7 @@ fn discover_models_for_backend(backend: &Backend) -> Result<Vec<String>, String>
     match backend {
         Backend::Copilot => discover_copilot_models(),
         Backend::ClaudeCode => {
-            // Verify the claude binary is installed before proceeding
-            let version_check = Command::new("claude")
-                .arg("--version")
-                .output()
-                .map_err(|e| {
-                    format!(
-                        "Failed to run 'claude --version': {}. \
-                         Is the Claude Code CLI installed?",
-                        e
-                    )
-                })?;
-            if !version_check.status.success() {
-                return Err(
-                    "The 'claude' CLI is installed but 'claude --version' failed. \
-                     Please verify your Claude Code installation."
-                        .to_string(),
-                );
-            }
-
-            // Verify required flags are supported using the same logic as the
-            // async check in claude_cli::verify_disallowed_tools_support().
+            verify_cli_version("claude", "Claude Code CLI")?;
             let help_output = Command::new("claude")
                 .arg("--help")
                 .output()
@@ -231,13 +232,53 @@ fn discover_models_for_backend(backend: &Backend) -> Result<Vec<String>, String>
             let help_stdout = String::from_utf8_lossy(&help_output.stdout);
             let help_stderr = String::from_utf8_lossy(&help_output.stderr);
             claude_cli::check_required_flags(&help_stdout, &help_stderr)?;
-
             Ok(config::claude_code_model_ids()
                 .iter()
                 .map(|s| s.to_string())
                 .collect())
         }
+        Backend::GeminiCli => {
+            verify_cli_version("gemini", "Gemini CLI")?;
+            let help_output = Command::new("gemini")
+                .arg("--help")
+                .output()
+                .map_err(|e| format!("Failed to run 'gemini --help': {}", e))?;
+            let help_stdout = String::from_utf8_lossy(&help_output.stdout);
+            let help_stderr = String::from_utf8_lossy(&help_output.stderr);
+            gemini_cli::check_required_flags(&help_stdout, &help_stderr)?;
+            Ok(config::gemini_cli_model_ids()
+                .iter()
+                .map(|s| s.to_string())
+                .collect())
+        }
     }
+}
+
+fn verify_cli_version(binary: &str, label: &str) -> Result<(), String> {
+    let version_check = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to run '{} --version': {}. Is {} installed?",
+                binary, e, label
+            )
+        })?;
+    if !version_check.status.success() {
+        return Err(format!(
+            "The '{}' CLI is installed but '{} --version' failed. Please verify your {} installation.",
+            binary, binary, label
+        ));
+    }
+    Ok(())
+}
+
+fn print_available_models(models: &[String]) {
+    println!("Available models:\n");
+    for (i, model) in models.iter().enumerate() {
+        println!("  [{}] {}", i + 1, model);
+    }
+    println!("\nYou can also paste a custom model ID instead of choosing a number.\n");
 }
 
 /// Discover models by parsing `copilot --help`.
@@ -250,7 +291,6 @@ fn discover_copilot_models() -> Result<Vec<String>, String> {
         .map_err(|e| format!("Failed to run 'copilot --help': {}", e))?;
 
     let help_text = String::from_utf8_lossy(&output.stdout).to_string();
-
     let models = parse_model_choices(&help_text);
 
     if models.is_empty() {
@@ -262,13 +302,11 @@ fn discover_copilot_models() -> Result<Vec<String>, String> {
 }
 
 fn parse_model_choices(help_text: &str) -> Vec<String> {
-    // Find the --model line specifically, then extract choices from it.
-    // The choices may span multiple continuation lines.
     let full = help_text.replace('\n', " ");
     let re = Regex::new(r#"--model\s+<[^>]+>\s+.*?\(choices:\s*(.*?)\)"#).unwrap();
     if let Some(caps) = re.captures(&full) {
         let choices_str = &caps[1];
-        let model_re = Regex::new(r#""([^"]+)""#).unwrap();
+        let model_re = Regex::new(r#"\"([^\"]+)\""#).unwrap();
         return model_re
             .captures_iter(choices_str)
             .map(|c| c[1].to_string())
@@ -309,9 +347,9 @@ fn prompt_yes_no(question: &str) -> Result<bool, String> {
     Ok(answer == "y" || answer == "yes")
 }
 
-fn prompt_model_choice(label: &str, models: &[String]) -> Result<usize, String> {
+fn prompt_model_choice(label: &str, models: &[String]) -> Result<String, String> {
     loop {
-        print!("{} (1-{}): ", label, models.len());
+        print!("{} (1-{} or custom model ID): ", label, models.len());
         io::stdout()
             .flush()
             .map_err(|e| format!("IO error: {}", e))?;
@@ -331,12 +369,15 @@ fn prompt_model_choice(label: &str, models: &[String]) -> Result<usize, String> 
             && n <= models.len()
         {
             println!("  -> {}", models[n - 1]);
-            return Ok(n - 1);
+            return Ok(models[n - 1].clone());
+        }
+        if !input.is_empty() {
+            println!("  -> {}", input);
+            return Ok(input.to_string());
         }
 
         eprintln!(
-            "  Invalid choice '{}'. Enter a number from 1 to {}.",
-            input,
+            "  Enter a number from 1 to {} or a custom model ID.",
             models.len()
         );
     }
@@ -370,13 +411,18 @@ fn prompt_string_with_default(label: &str, default: &str) -> Result<String, Stri
 fn sanitize_codename(raw: &str) -> Result<String, String> {
     let sanitized: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let sanitized = sanitized.trim_matches('-').to_string();
     if sanitized.is_empty() || !sanitized.chars().any(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(
-            "Codename '{}' contains no valid characters. \
-             Codenames must have at least one alphanumeric character.",
+            "Codename '{}' contains no valid characters. Codenames must have at least one alphanumeric character.",
             raw
         ));
     }
@@ -395,7 +441,12 @@ fn derive_codename(model: &str, used: &[String]) -> String {
         "sonnet"
     } else if model.contains("haiku") {
         "haiku"
-    } else if model.starts_with("gemini") {
+    } else if model.starts_with("gemini")
+        || model == "flash"
+        || model == "flash-lite"
+        || model == "pro"
+        || model == "auto"
+    {
         "gemini"
     } else if model.contains("codex-max") {
         "codex-max"
@@ -414,7 +465,6 @@ fn derive_codename(model: &str, used: &[String]) -> String {
         return candidate;
     }
 
-    // Append a suffix to avoid collision
     for i in 2..=9 {
         let suffixed = format!("{}{}", base, i);
         if !used.contains(&suffixed) {
@@ -422,4 +472,24 @@ fn derive_codename(model: &str, used: &[String]) -> String {
         }
     }
     model.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_model_choices_extracts_copilot_help_choices() {
+        let help = r#"Usage: copilot --model <model> foo (choices: "gpt-5", "claude-opus-4.6")"#;
+        assert_eq!(
+            parse_model_choices(help),
+            vec!["gpt-5".to_string(), "claude-opus-4.6".to_string()]
+        );
+    }
+
+    #[test]
+    fn derive_codename_maps_gemini_aliases() {
+        assert_eq!(derive_codename("flash", &[]), "gemini");
+        assert_eq!(derive_codename("pro", &["gemini".to_string()]), "gemini2");
+    }
 }

@@ -83,7 +83,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
     println!("\nConsolidating {} review file(s)...", selected_files.len());
 
     write_selected_reviews(
-        &config.backend,
+        &config.consolidate.backend,
         &repo_root,
         &state_dir,
         &selected_files,
@@ -135,7 +135,7 @@ pub async fn run_latest(config: &Config) -> Result<(), String> {
     );
 
     write_selected_reviews(
-        &config.backend,
+        &config.consolidate.backend,
         &repo_root,
         &state_dir,
         &selected_files,

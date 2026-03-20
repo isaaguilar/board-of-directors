@@ -197,12 +197,12 @@ pub async fn run(
         if let Some(max) = max_iterations {
             if iteration >= max {
                 session
-                    .mark_completed(format!("Iteration limit reached after {} iteration(s).", iteration))
+                    .mark_completed(format!(
+                        "Iteration limit reached after {} iteration(s).",
+                        iteration
+                    ))
                     .await;
-                println!(
-                    "\n== Iteration limit ({}) reached. Stopping. ==",
-                    max
-                );
+                println!("\n== Iteration limit ({}) reached. Stopping. ==", max);
                 break;
             }
         }
@@ -280,8 +280,15 @@ pub async fn run(
             break;
         }
 
-        println!("\n-- Step 2: Consolidating reviews --");
-        session.begin_consolidation(&config.consolidate.model).await;
+        let consolidate_label = format!(
+            "{} / {}",
+            config.consolidate.backend, config.consolidate.model
+        );
+        println!(
+            "\n-- Step 2: Consolidating reviews with {} --",
+            consolidate_label
+        );
+        session.begin_consolidation(&consolidate_label).await;
         let codenames: Vec<String> = config
             .review
             .models
@@ -292,7 +299,7 @@ pub async fn run(
         let report = match run_cancellable(
             &session,
             consolidate::run_auto(
-                &config.backend,
+                &config.consolidate.backend,
                 &state_dir,
                 &config.consolidate.model,
                 Some(&review_timestamp),
@@ -310,15 +317,13 @@ pub async fn run(
                     &review_timestamp,
                 );
                 session.set_latest_report(report_filename).await;
-                session
-                    .complete_consolidation(&config.consolidate.model)
-                    .await;
+                session.complete_consolidation(&consolidate_label).await;
                 report
             }
             StepOutcome::Completed(Err(e)) => {
                 eprintln!("  Consolidation failed: {}", e);
                 session
-                    .fail_consolidation(&config.consolidate.model, e.to_string())
+                    .fail_consolidation(&consolidate_label, e.to_string())
                     .await;
                 eprintln!("  Continuing to next iteration...");
                 continue;
@@ -391,18 +396,17 @@ pub async fn run(
         let prior_log = bugfix_log::read_log_parts_with_migration(&state_dir, &sanitized_branch)?;
         let snapshot = rollback::capture(&repo_root)?;
         session.set_will_revert_on_cancel(true).await;
-        session
-            .begin_fix(total_actionable, &config.bugfix.model)
-            .await;
+        let bugfix_label = format!("{} / {}", config.bugfix.backend, config.bugfix.model);
+        session.begin_fix(total_actionable, &bugfix_label).await;
 
         println!(
             "\n-- Step 3: Fixing {} issue(s) with {} --",
-            total_actionable, config.bugfix.model
+            total_actionable, bugfix_label
         );
 
         match run_fix_agent(
             &session,
-            &config.backend,
+            &config.bugfix.backend,
             &repo_root,
             &state_dir,
             &report,
@@ -418,7 +422,7 @@ pub async fn run(
         {
             FixAgentOutcome::Completed(Ok(())) => {
                 session.set_will_revert_on_cancel(false).await;
-                session.complete_fix(&config.bugfix.model).await;
+                session.complete_fix(&bugfix_label).await;
                 session
                     .set_message("Fix step complete. Starting the next review cycle...")
                     .await;
@@ -441,7 +445,7 @@ pub async fn run(
                     session.mark_error(message.clone()).await;
                     return Err(message);
                 }
-                session.fail_fix(&config.bugfix.model, e.to_string()).await;
+                session.fail_fix(&bugfix_label, e.to_string()).await;
                 eprintln!("  Continuing to next iteration...");
                 continue;
             }
@@ -673,7 +677,7 @@ For each fix, write:
         state_dir,
         &mut cancel_rx,
     )
-        .await
+    .await
     {
         Ok(backend::AgentRunResult::Completed(output)) => output,
         Ok(backend::AgentRunResult::Cancelled) => return FixAgentOutcome::Cancelled,

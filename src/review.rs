@@ -6,6 +6,7 @@ use crate::files;
 use crate::git;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewErrorKind {
@@ -104,7 +105,14 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
     // Reserve all output files first (before spawning any tasks) so that a
     // file-creation failure doesn't leave already-spawned tasks running as
     // detached zombies. Tokio tasks are NOT cancelled when a JoinHandle is dropped.
-    let mut reserved: Vec<(String, PathBuf, agents::ReservedFile, String, String)> = Vec::new();
+    let mut reserved: Vec<(
+        String,
+        PathBuf,
+        agents::ReservedFile,
+        Backend,
+        String,
+        String,
+    )> = Vec::new();
     for entry in &config.review.models {
         let (filename, guard) =
             agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
@@ -114,22 +122,35 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
             filename,
             output_path,
             guard,
+            entry.backend,
             entry.model.clone(),
             entry.codename.clone(),
         ));
     }
 
+    let start_delays = reviewer_start_delays(reserved.len());
     let mut handles = Vec::new();
 
-    for (filename, output_path, guard, model_id, codename) in reserved {
+    for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
+        reserved.into_iter().zip(start_delays.into_iter())
+    {
         let diff_text = diff_for_prompt.to_string();
         let repo_root = repo_root.clone();
         let state_dir = state_dir.clone();
-        let backend = config.backend;
+        if !start_delay.is_zero() {
+            println!(
+                "  Scheduling reviewer '{}' to start in {}s to spread agent load.",
+                codename,
+                start_delay.as_secs()
+            );
+        }
 
         let handle = tokio::spawn(async move {
+            if !start_delay.is_zero() {
+                tokio::time::sleep(start_delay).await;
+            }
             run_agent_review(
-                &backend,
+                &agent_backend,
                 &repo_root,
                 &state_dir,
                 &codename,
@@ -248,7 +269,14 @@ pub async fn run_for_bugfix(
         &diff
     };
 
-    let mut reserved: Vec<(String, PathBuf, agents::ReservedFile, String, String)> = Vec::new();
+    let mut reserved: Vec<(
+        String,
+        PathBuf,
+        agents::ReservedFile,
+        Backend,
+        String,
+        String,
+    )> = Vec::new();
     for entry in &config.review.models {
         let (filename, guard) =
             agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
@@ -258,23 +286,36 @@ pub async fn run_for_bugfix(
             filename,
             output_path,
             guard,
+            entry.backend,
             entry.model.clone(),
             entry.codename.clone(),
         ));
     }
 
     let mut join_set = tokio::task::JoinSet::new();
-    for (filename, output_path, guard, model_id, codename) in reserved {
+    let start_delays = reviewer_start_delays(reserved.len());
+    for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
+        reserved.into_iter().zip(start_delays.into_iter())
+    {
         let diff_text = diff_for_prompt.to_string();
         let repo_root = repo_root.clone();
         let state_dir = state_dir.clone();
-        let backend = config.backend;
+        if !start_delay.is_zero() {
+            println!(
+                "  Scheduling reviewer '{}' to start in {}s to spread agent load.",
+                codename,
+                start_delay.as_secs()
+            );
+        }
         join_set.spawn(async move {
+            if !start_delay.is_zero() {
+                tokio::time::sleep(start_delay).await;
+            }
             (
                 filename,
                 codename.clone(),
                 run_agent_review(
-                    &backend,
+                    &agent_backend,
                     &repo_root,
                     &state_dir,
                     &codename,
@@ -314,7 +355,9 @@ pub async fn run_for_bugfix(
         match joined {
             Ok((filename, codename, Ok(()))) => {
                 println!("  [ok] {}", filename);
-                session.note_review_agent_result(&codename, true, None).await;
+                session
+                    .note_review_agent_result(&codename, true, None)
+                    .await;
                 success_count += 1;
             }
             Ok((filename, codename, Err(e))) => {
@@ -474,6 +517,30 @@ Here is the diff to review:
     Ok(())
 }
 
+fn reviewer_start_delays(count: usize) -> Vec<Duration> {
+    let mut delays = Vec::with_capacity(count);
+    let mut cumulative_secs = 0u64;
+    for index in 0..count {
+        if index > 0 {
+            cumulative_secs += random_reviewer_jitter_secs();
+        }
+        delays.push(Duration::from_secs(cumulative_secs));
+    }
+    delays
+}
+
+fn random_reviewer_jitter_secs() -> u64 {
+    let mut bytes = [0u8; 1];
+    if let Err(e) = getrandom::fill(&mut bytes) {
+        eprintln!(
+            "Warning: failed to read random bytes for reviewer jitter: {}. Falling back to 2 seconds.",
+            e
+        );
+        return 2;
+    }
+    2 + (bytes[0] as u64 % 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +557,14 @@ mod tests {
         let error = ReviewError::retryable("retry");
         assert!(!error.is_fatal());
         assert_eq!(error.to_string(), "retry");
+    }
+
+    #[test]
+    fn reviewer_start_delays_are_staggered() {
+        let delays = reviewer_start_delays(3);
+        assert_eq!(delays.len(), 3);
+        assert_eq!(delays[0], Duration::from_secs(0));
+        assert!((2..=5).contains(&delays[1].as_secs()));
+        assert!((4..=10).contains(&delays[2].as_secs()));
     }
 }

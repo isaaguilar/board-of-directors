@@ -8,6 +8,7 @@ mod config;
 mod consolidate;
 mod copilot_cli;
 mod files;
+mod gemini_cli;
 mod git;
 mod init;
 mod paths;
@@ -116,26 +117,37 @@ async fn main() {
         }
     };
 
-    let mut config = config::load(&repo_root);
+    let mut config = match config::load(&repo_root) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
     config::normalize_models_for_backend(&mut config);
     if let Err(e) = config::validate_models_for_backend(&config) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 
-    // Only run Claude-specific safety checks for commands that actually invoke agents.
-    // This avoids spurious stderr output and subprocess calls for non-agent commands
-    // like `bod version` or `bod init`.
-    let needs_agent = matches!(
-        cli.command,
-        Commands::Review { .. } | Commands::Consolidate | Commands::Bugfix { .. }
-    );
-    if needs_agent && config.backend == config::Backend::ClaudeCode {
-        if let Err(e) = claude_cli::verify_disallowed_tools_support().await {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+    for backend in active_backends_for_command(&cli.command, &config) {
+        match backend {
+            config::Backend::ClaudeCode => {
+                if let Err(e) = claude_cli::verify_disallowed_tools_support().await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                claude_cli::print_permissions_warning();
+            }
+            config::Backend::GeminiCli => {
+                if let Err(e) = gemini_cli::verify_required_flags().await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                gemini_cli::print_permissions_warning();
+            }
+            config::Backend::Copilot => {}
         }
-        claude_cli::print_permissions_warning();
     }
 
     let result = match cli.command {
@@ -154,7 +166,17 @@ async fn main() {
             prompt,
             delay_start,
         } => match bugfix::SeverityLevel::from_str(&severity) {
-            Ok(level) => bugfix::run(timeout, iterations, level, &config, prompt.as_deref(), delay_start).await,
+            Ok(level) => {
+                bugfix::run(
+                    timeout,
+                    iterations,
+                    level,
+                    &config,
+                    prompt.as_deref(),
+                    delay_start,
+                )
+                .await
+            }
             Err(e) => Err(e),
         },
         Commands::Init { .. } | Commands::Version => unreachable!(),
@@ -163,6 +185,38 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+fn active_backends_for_command(
+    command: &Commands,
+    config: &config::Config,
+) -> Vec<config::Backend> {
+    let mut backends = Vec::new();
+    match command {
+        Commands::Review { command: None } => {
+            for entry in &config.review.models {
+                push_backend(&mut backends, entry.backend);
+            }
+        }
+        Commands::Review {
+            command: Some(ReviewCommands::Consolidate),
+        }
+        | Commands::Consolidate => {
+            push_backend(&mut backends, config.consolidate.backend);
+        }
+        Commands::Bugfix { .. } => {
+            backends = config.used_backends();
+        }
+        Commands::Init { .. } | Commands::Version => {}
+    }
+    backends.sort();
+    backends
+}
+
+fn push_backend(backends: &mut Vec<config::Backend>, backend: config::Backend) {
+    if !backends.contains(&backend) {
+        backends.push(backend);
     }
 }
 
@@ -226,5 +280,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn active_backends_for_review_only_uses_reviewer_backends() {
+        let command = Commands::Review { command: None };
+        let config = config::Config {
+            review: config::ReviewConfig {
+                models: vec![config::ModelEntry {
+                    codename: "r1".to_string(),
+                    backend: config::Backend::Copilot,
+                    model: "gpt-5.3-codex".to_string(),
+                }],
+            },
+            consolidate: config::ConsolidateConfig {
+                backend: config::Backend::GeminiCli,
+                model: "flash".to_string(),
+            },
+            bugfix: config::BugfixConfig {
+                backend: config::Backend::ClaudeCode,
+                model: "sonnet".to_string(),
+            },
+        };
+
+        assert_eq!(
+            active_backends_for_command(&command, &config),
+            vec![config::Backend::Copilot]
+        );
+    }
+
+    #[test]
+    fn active_backends_for_consolidate_only_uses_consolidator_backend() {
+        let command = Commands::Consolidate;
+        let config = config::Config {
+            review: config::ReviewConfig::default(),
+            consolidate: config::ConsolidateConfig {
+                backend: config::Backend::GeminiCli,
+                model: "flash".to_string(),
+            },
+            bugfix: config::BugfixConfig {
+                backend: config::Backend::ClaudeCode,
+                model: "sonnet".to_string(),
+            },
+        };
+
+        assert_eq!(
+            active_backends_for_command(&command, &config),
+            vec![config::Backend::GeminiCli]
+        );
     }
 }
