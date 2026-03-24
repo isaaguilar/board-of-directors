@@ -395,12 +395,23 @@ You MUST use the -RESOLVED suffix for any issue that the bugfix log confirms has
 Do NOT use bare [CRITICAL] or [HIGH] for issues that are already fixed -- that causes
 the automated fixer to re-attempt fixes that are already done, wasting time and risking regressions.
 
+CRITICAL RULE -- each severity tag must appear EXACTLY ONCE per unique issue, in the finding
+body only. Do NOT repeat severity tags in the Final Verdict or anywhere else in the report.
+The Final Verdict section must reference findings by title or description only -- no `[CRITICAL]`,
+`[HIGH]`, `[MEDIUM]`, or `[LOW]` tags. These tags are parsed by deterministic code that counts
+every occurrence; a tag repeated in a summary will be treated as a separate additional issue
+and trigger a duplicate fix attempt.
+
 Example format:
 ## Common Findings
 
 [CRITICAL] Buffer overflow in parse_input -- the slice at line 42 can panic on multi-byte UTF-8
 
 [HIGH-RESOLVED] Missing null check in user_lookup -- fixed in iteration 2 by adding guard clause
+
+## Final Verdict
+
+Fix the buffer overflow in parse_input before merging. (No severity tag here -- reference by title only.)
 "#
     } else {
         ""
@@ -449,10 +460,12 @@ invent issues that are unsupported by the reviews or code.
 
 You have been given reviews from different AI agents who independently reviewed the same code changes. Your task:
 
-1. **Common Findings** (highest priority): Identify issues that multiple reviewers flagged. These are the most important since independent reviewers converged on them.
-2. **Unique Findings**: List issues that only one reviewer found, but are still worth addressing.
-3. **Outliers** (lowest priority): List observations that seem like edge cases or minor style preferences. Put these at the end.
-4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first.
+1. **Common Findings** (highest priority): Identify issues that multiple reviewers flagged. These are the most important since independent reviewers converged on them. If reviewers found no common issues, explicitly say so.
+2. **Unique Findings**: List issues that only one reviewer found, but are still worth addressing. If there are none, say so.
+3. **Outliers** (lowest priority): List observations that seem like edge cases or minor style preferences. Put these at the end. If there are none, omit this section.
+4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first. If the code is fundamentally correct and no meaningful issues were found, say that clearly.
+
+Do not manufacture findings to fill sections. An empty finding list is a valid and correct outcome. Only report issues that the reviewers actually raised and that genuinely exist in the code.
 
 Format as clean, readable markdown. Be concise and actionable.
 - Do NOT run `git commit` or `git push`.

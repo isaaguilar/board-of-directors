@@ -605,8 +605,9 @@ fn build_review_agent_request(
         r#"You are a senior code reviewer. Review the current git branch against `origin/{default_branch}`.
 
 Your task:
-- Identify critical bugs, logic errors, security vulnerabilities, and correctness issues.
-- Be very critical but constructive -- provide actionable feedback.
+- Identify bugs, logic errors, security vulnerabilities, and correctness issues -- but only flag real problems that genuinely exist.
+- Be objective and constructive -- provide actionable feedback calibrated to the actual severity of each issue.
+- If the code is correct and the change is sound, say so. Do not invent or inflate issues to fill the review.
 - Prioritize correctness over complexity.
 - Keep your review concise enough for a human to read quickly. Do not be overly verbose.
 - Format your review as markdown.
